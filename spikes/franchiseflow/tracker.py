@@ -224,8 +224,8 @@ def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
     """
     if scene_plan is None:
         return None
-    if not isinstance(scene_plan, list) or not 1 <= len(scene_plan) <= 2:
-        raise ValueError("scene_plan must contain between 1 and 2 scenes")
+    if not isinstance(scene_plan, list) or not 1 <= len(scene_plan) <= 8:
+        raise ValueError("scene_plan must contain between 1 and 8 scenes")
 
     normalized: list[dict] = []
     previous_end = -1

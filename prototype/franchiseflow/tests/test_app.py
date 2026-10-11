@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate, _public_summary
 from job_store import load_job, save_job
+from scene_samples import sample_video_scenes
 
 
 def _make_dummy_mp4():
@@ -252,7 +253,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
         summary = {"frames": 4, "fps": 10.0, "failed_frames": [], "output_videos": []}
         with patch("app.VisionClient", return_value=mock_instance), \
              patch("app.validate_candidate", return_value={"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}), \
-             patch("app.run_tracker", return_value=summary) as tracker:
+             patch("app.run_tracker", return_value=summary) as tracker, \
+             patch("app.sample_video_scenes", wraps=sample_video_scenes) as scene_sampler:
             response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
@@ -260,6 +262,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
         call = tracker.call_args.kwargs
         self.assertEqual([item["scene_id"] for item in call["scene_plan"]], ["scene_001", "scene_002"])
         self.assertEqual([item["start_frame"] for item in call["scene_plan"]], [0, 2])
+        self.assertEqual(scene_sampler.call_args.kwargs["max_scenes"], 8)
 
     def test_target_hint_is_persisted_and_forwarded_to_vision_client(self):
         data = {
