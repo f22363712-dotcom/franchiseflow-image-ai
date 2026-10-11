@@ -9,6 +9,8 @@ spikes/franchiseflow/outputs*/
 spikes/franchiseflow/out_actual/
 spikes/franchiseflow/_tmp_test/
 spikes/franchiseflow/fixtures/grid.jpg
+spikes/franchiseflow/fixtures/demo_cut.mp4
+
 
 # Local prototype artifacts from earlier experiments
 prototype/adsafezone/uploads/

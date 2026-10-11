@@ -163,63 +163,107 @@ def composite(frame, sign, quad, illumination=False):
     return np.clip(frame.astype(np.float32) * (1 - alpha) + colour * alpha, 0, 255).astype(np.uint8)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--video", type=Path, required=True)
-    parser.add_argument("--quad", type=Path, required=True, help="manual TL TR BR BL pixel coordinates")
-    parser.add_argument("--signs", type=Path, nargs=3, required=True, metavar="PNG")
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--min-inliers", type=int, default=8)
-    parser.add_argument("--ransac-px", type=float, default=3.0)
-    parser.add_argument("--ratio", type=float, default=0.75)
-    parser.add_argument("--illumination", action="store_true", help="approximate low-frequency lighting, not occlusion handling")
-    parser.add_argument("--no-debug", action="store_true")
-    args = parser.parse_args()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    cap = cv2.VideoCapture(str(args.video))
+def parse_quad(value: Any) -> np.ndarray:
+    if isinstance(value, (str, Path)):
+        return read_quad(Path(value))
+    quad = np.asarray(value.get("quad", value.get("corners")) if isinstance(value, dict) else value, np.float32)
+    if quad.shape != (4, 2) or not np.isfinite(quad).all():
+        raise ValueError("quad must contain four finite [x,y] points, TL TR BR BL")
+    if not cv2.isContourConvex(np.round(quad).astype(np.int32)) or abs(cv2.contourArea(quad)) < 100:
+        raise ValueError("quad must be a convex nondegenerate polygon")
+    return quad
+
+
+def run_tracker(
+    video: str | Path,
+    quad: list | np.ndarray | str | Path,
+    signs: list[str | Path],
+    out_dir: str | Path,
+    illumination: bool = False,
+    max_frames: int = 0,
+    min_inliers: int = 8,
+    ransac_px: float = 3.0,
+    ratio: float = 0.75,
+    no_debug: bool = False,
+    initialization_mode: str = "manual_fallback",
+) -> dict[str, Any]:
+    video_path = Path(video)
+    if not video_path.exists():
+        raise ValueError(f"video does not exist: {video_path}")
+    if len(signs) != 3:
+        raise ValueError(f"exactly 3 signs are required, got {len(signs)}")
+    for sign_path in signs:
+        if not Path(sign_path).exists():
+            raise ValueError(f"sign does not exist: {sign_path}")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    quad_pts = parse_quad(quad)
+
+    cap = cv2.VideoCapture(str(video_path))
     ok, first = cap.read()
     if not ok:
-        raise ValueError(f"cannot decode {args.video}")
-    quad = read_quad(args.quad)
-    tracker = PlanarTracker(first, quad, args.min_inliers, args.ransac_px, args.ratio)
-    signs = [load_sign(p) for p in args.signs]
+        cap.release()
+        raise ValueError(f"cannot decode {video_path}")
+
+    tracker = PlanarTracker(first, quad_pts, min_inliers, ransac_px, ratio)
+    loaded_signs = [load_sign(Path(p)) for p in signs]
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     height, width = first.shape[:2]
-    paths = [args.out_dir / f"branch_{i+1}_{p.stem}.mp4" for i, p in enumerate(args.signs)]
+    paths = [out_dir / f"branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writers = [cv2.VideoWriter(str(p), fourcc, fps, (width, height)) for p in paths]
-    debug = None if args.no_debug else cv2.VideoWriter(str(args.out_dir / "tracking_debug.mp4"), fourcc, fps, (width, height))
+    debug = None if no_debug else cv2.VideoWriter(str(out_dir / "tracking_debug.mp4"), fourcc, fps, (width, height))
     if not all(w.isOpened() for w in writers) or (debug is not None and not debug.isOpened()):
+        cap.release()
+        for w in writers:
+            w.release()
+        if debug is not None:
+            debug.release()
         raise ValueError("cannot open MP4 output writers")
+
     records, t0 = [], time.perf_counter()
     frame, index = first, 0
-    log_file = (args.out_dir / "tracking.jsonl").open("w", encoding="utf-8")
+    log_file = (out_dir / "tracking.jsonl").open("w", encoding="utf-8")
     try:
         while frame is not None:
             if index == 0:
                 h = np.eye(3)
-                detail = {"status": "ok", "method": "manual_first_frame", "quad": quad.tolist(),
-                          "inliers": len(tracker.key0), "reprojection_median_px": 0.0, "reprojection_p95_px": 0.0}
+                detail = {
+                    "status": "ok",
+                    "method": "manual_first_frame" if initialization_mode == "manual_fallback" else "vision_first_frame",
+                    "quad": quad_pts.tolist(),
+                    "inliers": len(tracker.key0),
+                    "reprojection_median_px": 0.0,
+                    "reprojection_p95_px": 0.0,
+                }
             else:
                 h, detail = tracker.track(frame)
             detail.update(frame=index, seconds=index / fps)
             records.append(detail)
             log_file.write(json.dumps(detail) + "\n")
-            current_quad = project_quad(h, quad) if h is not None else None
-            for writer, sign in zip(writers, signs):
-                writer.write(composite(frame, sign, current_quad, args.illumination) if current_quad is not None else frame)
+            current_quad = project_quad(h, quad_pts) if h is not None else None
+            for writer, sign in zip(writers, loaded_signs):
+                writer.write(composite(frame, sign, current_quad, illumination) if current_quad is not None else frame)
             if debug is not None:
                 annotated = frame.copy()
                 if current_quad is not None:
                     cv2.polylines(annotated, [np.round(current_quad).astype(np.int32)], True, (0, 255, 255), 2)
-                label = f"{index} {detail['status']} {detail['method']} inliers={detail.get('inliers',0)} err={detail.get('reprojection_median_px',0):.2f}px"
+                label = f"{index} {detail['status']} {detail['method']} inliers={detail.get('inliers', 0)} err={detail.get('reprojection_median_px', 0):.2f}px"
                 cv2.rectangle(annotated, (0, 0), (width, 38), (0, 0, 0), -1)
-                cv2.putText(annotated, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                            (0, 255, 0) if h is not None else (0, 0, 255), 2)
+                cv2.putText(
+                    annotated,
+                    label,
+                    (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 0) if h is not None else (0, 0, 255),
+                    2,
+                )
                 debug.write(annotated)
             index += 1
-            if args.max_frames and index >= args.max_frames:
+            if max_frames and index >= max_frames:
                 break
             ok, frame = cap.read()
             if not ok:
@@ -231,24 +275,61 @@ def main():
             writer.release()
         if debug is not None:
             debug.release()
-    tracked = [r for r in records[1:] if r["status"] == "ok"]
-    failed = [r["frame"] for r in records if r["status"] == "failed"]
-    summary = {
-        "video": str(args.video.resolve()), "manual_first_frame_quad": quad.tolist(),
-        "scope": "manual quad + traditional CV tracking/compositing; no GPT runtime; no audio; no automatic occlusion",
-        "metrics_warning": "Reprojection residuals are internal fit indicators, not ground-truth corner accuracy or visual proof.",
-        "frames": index, "fps": fps, "duration_seconds": index / fps, "failed_frames": failed,
-        "failed_fraction": len(failed) / max(index - 1, 1),
-        "anchor_sift_frames": sum(r["method"] == "anchor_sift" for r in tracked),
-        "anchor_lk_frames": sum(r["method"] == "anchor_lk" for r in tracked),
-        "first_frame_sift_features": len(tracker.key0),
-        "median_inliers": float(np.median([r["inliers"] for r in tracked])) if tracked else None,
-        "reprojection_median_px": float(np.median([r["reprojection_median_px"] for r in tracked])) if tracked else None,
-        "reprojection_p95_px": float(np.percentile([r["reprojection_p95_px"] for r in tracked], 95)) if tracked else None,
-        "processing_seconds": time.perf_counter() - t0, "output_videos": [str(p.resolve()) for p in paths],
-        "opencv_version": cv2.__version__, "numpy_version": np.__version__,
-    }
-    (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    from metrics import compute_summary
+
+    summary = compute_summary(
+        records=records,
+        fps=fps,
+        total_frames=index,
+        elapsed_seconds=time.perf_counter() - t0,
+        video_path=video_path,
+        quad=quad_pts,
+        output_videos=paths,
+        mode=initialization_mode,
+        extra={
+            "opencv_version": cv2.__version__,
+            "numpy_version": np.__version__,
+        },
+    )
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--video", type=Path, required=True)
+    parser.add_argument("--quad", type=Path, help="manual TL TR BR BL pixel coordinates")
+    parser.add_argument("--quad-json", type=Path, help="JSON file containing quad corners")
+    parser.add_argument("--signs", type=Path, nargs=3, required=True, metavar="PNG")
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--min-inliers", type=int, default=8)
+    parser.add_argument("--ransac-px", type=float, default=3.0)
+    parser.add_argument("--ratio", type=float, default=0.75)
+    parser.add_argument("--illumination", action="store_true", help="approximate low-frequency lighting, not occlusion handling")
+    parser.add_argument("--no-debug", action="store_true")
+    args = parser.parse_args()
+
+    quad_arg = args.quad or args.quad_json
+    if not quad_arg:
+        raise ValueError("either --quad or --quad-json must be provided")
+
+    mode = "manual_fallback" if args.quad else "vision_quad"
+
+    summary = run_tracker(
+        video=args.video,
+        quad=quad_arg,
+        signs=args.signs,
+        out_dir=args.out_dir,
+        illumination=args.illumination,
+        max_frames=args.max_frames,
+        min_inliers=args.min_inliers,
+        ransac_px=args.ransac_px,
+        ratio=args.ratio,
+        no_debug=args.no_debug,
+        initialization_mode=mode,
+    )
     print(json.dumps(summary, indent=2))
 
 
