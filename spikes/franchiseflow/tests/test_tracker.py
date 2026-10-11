@@ -217,6 +217,8 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertEqual(summary["frames"], 6)
         self.assertEqual(summary["scene_count"], 2)
         self.assertEqual([item["scene_id"] for item in summary["scenes"]], ["scene_001", "scene_002"])
+        self.assertEqual(len(summary["branch_scene_surface_map"]), 1)
+        self.assertEqual(summary["branch_scene_surface_map"][0]["scenes"][1]["surface_ids"], ["surface_002"])
         records = [json.loads(line) for line in (self.temp_dir / "two_scene_out" / "tracking.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual([records[i]["scene_id"] for i in (0, 2, 3, 5)], ["scene_001", "scene_001", "scene_002", "scene_002"])
         self.assertEqual(records[0]["surface_details"][0]["surface_id"], "surface_001")

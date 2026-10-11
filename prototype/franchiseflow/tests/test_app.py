@@ -354,6 +354,19 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(len(res.get_json()["outputs"]), 2)
 
+    def test_output_route_supports_http_range_requests(self):
+        job_dir = OUTPUT_DIR / "range_test"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "sample.mp4").write_bytes(b"0123456789")
+        try:
+            response = self.client.get("/outputs/range_test/sample.mp4", headers={"Range": "bytes=0-3"})
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.data, b"0123")
+            self.assertTrue(response.headers["Content-Range"].startswith("bytes 0-3/10"))
+            response.close()
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
     def test_rejects_path_like_job_ids_without_server_error(self):
         for url in ("/api/jobs/%2e%2e", "/api/jobs/%2e%2e/outputs", "/outputs/%2e%2e/app.py"):
             response = self.client.get(url)

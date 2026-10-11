@@ -579,6 +579,16 @@ def run_tracker(
             "failed_frames": sum(1 for record in records if record.get("status") != "ok"),
             "surface_failures": [],
         }]
+    branch_scene_surface_map = [
+        {
+            "branch_index": branch_index,
+            "scenes": [
+                {"scene_id": scene["scene_id"], "surface_ids": scene["surface_ids"]}
+                for scene in scene_summary
+            ],
+        }
+        for branch_index in range(1, len(signs) + 1)
+    ]
     summary = compute_summary(
         records=records,
         fps=fps,
@@ -608,6 +618,7 @@ def run_tracker(
             "source_candidate": source_candidate,
             "scene_count": len(scene_summary),
             "scenes": scene_summary,
+            "branch_scene_surface_map": branch_scene_surface_map,
         },
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
