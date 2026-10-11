@@ -215,6 +215,39 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertGreater(int(contained[60, 60, 2]), 180)
         self.assertGreater(int(covered[22, 60, 2]), 180)
 
+    def test_render_preserves_high_confidence_foreground_occluder(self):
+        video_path = self.temp_dir / "occluder.mp4"
+        height, width = 360, 520
+        rng = np.random.default_rng(4)
+        base = np.full((height, width, 3), 120, dtype=np.uint8)
+        for y in range(80, 280, 20):
+            for x in range(80, 440, 20):
+                color = tuple(int(value) for value in rng.integers(0, 255, 3))
+                cv2.rectangle(base, (x, y), (x + 15, y + 15), color, -1)
+        quad = np.float32([[80, 80], [440, 80], [440, 280], [80, 280]])
+        motion = np.float32([[1.05, 0.03, 8], [0.01, 1.02, 4], [0, 0, 1]])
+        current = cv2.warpPerspective(base, motion, (width, height))
+        cv2.rectangle(current, (180, 120), (280, 260), (0, 0, 0), -1)
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (width, height))
+        writer.write(base)
+        writer.write(current)
+        writer.release()
+        sign = self.temp_dir / "occluder_sign.png"
+        sign_image = np.zeros((100, 200, 4), dtype=np.uint8)
+        sign_image[:, :, :3] = (0, 0, 255)
+        sign_image[:, :, 3] = 255
+        cv2.imwrite(str(sign), sign_image)
+
+        summary = run_tracker(video_path, quad, [sign], self.temp_dir / "occluder_out", no_debug=True)
+
+        self.assertGreaterEqual(summary["occlusion_hint_count"], 1)
+        output = cv2.VideoCapture(str(self.temp_dir / "occluder_out" / "branch_1_occluder_sign.mp4"))
+        output.set(cv2.CAP_PROP_POS_FRAMES, 1)
+        ok, rendered = output.read()
+        output.release()
+        self.assertTrue(ok)
+        self.assertLess(int(rendered[190, 230, 2]), 80)
+
     def test_run_tracker_supports_two_independent_surfaces(self):
         video_path = self.temp_dir / "two_surfaces.mp4"
         frame = _create_textured_image()

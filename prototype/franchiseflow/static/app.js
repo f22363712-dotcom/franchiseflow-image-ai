@@ -27,6 +27,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const metricScenes = document.getElementById('metric-scenes');
   const metricSurfaces = document.getElementById('metric-surfaces');
   const metricOutputContract = document.getElementById('metric-output-contract');
+  const metricOcclusion = document.getElementById('metric-occlusion');
   const sceneReviewControls = document.getElementById('scene-review-controls');
   const scenePicker = document.getElementById('review-scene-picker');
   const surfacePicker = document.getElementById('review-surface-picker');
@@ -382,6 +383,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (metricOutputContract) {
       const checks = Array.isArray(summary.output_validation) ? summary.output_validation : [];
       metricOutputContract.textContent = checks.length && checks.every(item => item.validated) ? `已验收 ${checks.length} 条` : (mode === 'manual_fallback' ? '样片基线' : '-');
+    }
+    if (metricOcclusion) {
+      metricOcclusion.textContent = summary.occlusion_hint_count != null ? `${summary.occlusion_hint_count} 帧` : '-';
     }
   }
 

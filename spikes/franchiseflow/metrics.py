@@ -57,7 +57,7 @@ def compute_summary(
         "video": str(Path(video_path).resolve()),
         "initialization_mode": mode,
         "first_frame_quad": quad_list,
-        "scope": "planar sign tracking and multi-branch perspective compositing; safe original frame fallback",
+        "scope": "planar sign tracking, multi-branch perspective compositing, and conservative foreground-pixel preservation",
         "metrics_warning": "Reprojection residuals are internal fit indicators, not ground-truth corner accuracy or visual proof.",
         "frames": total_frames,
         "fps": fps,

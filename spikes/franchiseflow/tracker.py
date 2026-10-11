@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from occlusion import estimate_occlusion_mask
+
 
 def transcode_to_h264(input_path: Path, output_path: Path, audio_source: Path | None = None) -> Path:
     """Transcode video to H.264 and optionally copy audio from the source video."""
@@ -503,6 +505,7 @@ def run_tracker(
     scene_plan: list[dict] | None = None,
     asset_bindings: list[dict] | None = None,
     branch_labels: list[str] | None = None,
+    preserve_occlusion: bool = True,
 ) -> dict[str, Any]:
     video_path = Path(video)
     if not video_path.exists():
@@ -621,6 +624,7 @@ def run_tracker(
 
     records, t0 = [], time.perf_counter()
     frame, index = first, 0
+    anchor_frame = first
     scene_index = 0
     active_scene = None
     active_scene_stats = None
@@ -642,6 +646,7 @@ def run_tracker(
                 if index == scene_config["start_frame"]:
                     active_scene = scene_config
                     active_scene_stats = scene_stats[scene_index]
+                    anchor_frame = frame.copy()
                     surface_points = [surface["quad"] for surface in active_scene["surfaces"]]
                     active_surface_ids = [surface["surface_id"] for surface in active_scene["surfaces"]]
                     surface_count = len(surface_points)
@@ -657,6 +662,7 @@ def run_tracker(
 
             surface_details = []
             homographies = []
+            occlusion_masks = []
             for surface_index, tracker in enumerate(trackers):
                 surface_quad = surface_points[surface_index]
                 surface_config = active_scene["surfaces"][surface_index] if active_scene is not None else None
@@ -699,6 +705,19 @@ def run_tracker(
                     surface_detail.update({"scene_id": scene_id, "surface_id": surface_id, "initialization_mode": surface_mode})
                 surface_details.append(surface_detail)
                 homographies.append(h)
+                occlusion_mask = None
+                if (preserve_occlusion and h is not None and
+                        not (active_scene is not None and index == active_scene["start_frame"]) and
+                        not (active_scene is None and index == 0)):
+                    try:
+                        occlusion = estimate_occlusion_mask(anchor_frame, frame, h, surface_quad)
+                        public_occlusion = {key: value for key, value in occlusion.items() if key != "mask"}
+                        surface_detail["occlusion"] = public_occlusion
+                        if occlusion.get("status") == "occlusion_hint":
+                            occlusion_mask = occlusion.get("mask")
+                    except (TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                        surface_detail["occlusion"] = {"status": "error", "reason": str(exc)}
+                occlusion_masks.append(occlusion_mask)
 
             if normalized_scene_plan is not None:
                 valid_details = [item for item in surface_details if item.get("status") == "ok"]
@@ -739,9 +758,13 @@ def run_tracker(
             for branch_index, (writer, sign) in enumerate(zip(writers, loaded_signs), start=1):
                 allowed_surface_ids = bindings_by_branch[branch_index]
                 rendered = frame
-                for surface_id, current_quad in zip(active_surface_ids, current_quads):
+                for surface_position, (surface_id, current_quad) in enumerate(zip(active_surface_ids, current_quads)):
+                    occlusion_mask = occlusion_masks[surface_position] if surface_position < len(occlusion_masks) else None
                     if current_quad is not None and surface_id in allowed_surface_ids:
                         rendered = composite(rendered, sign, current_quad, illumination, fit_by_branch[branch_index])
+                        if occlusion_mask is not None:
+                            keep_original = occlusion_mask > 0
+                            rendered[keep_original] = frame[keep_original]
                 writer.write(rendered)
             if debug is not None:
                 annotated = frame.copy()
@@ -849,6 +872,19 @@ def run_tracker(
         }
         for branch_index in range(1, len(signs) + 1)
     ]
+    occlusion_hints = []
+    for record in records:
+        details = record.get("surface_details") or [record]
+        hints = [
+            {
+                "surface_index": item.get("surface_index"),
+                **{key: value for key, value in item.get("occlusion", {}).items() if key != "mask"},
+            }
+            for item in details
+            if item.get("occlusion", {}).get("status") == "occlusion_hint"
+        ]
+        if hints:
+            occlusion_hints.append({"frame": record["frame"], "scene_id": record.get("scene_id") or "scene_001", "surfaces": hints})
     summary = compute_summary(
         records=records,
         fps=fps,
@@ -882,6 +918,9 @@ def run_tracker(
             "scenes": scene_summary,
             "branch_scene_surface_map": branch_scene_surface_map,
             "asset_bindings": normalized_bindings,
+            "preserve_occlusion": bool(preserve_occlusion),
+            "occlusion_hint_count": len(occlusion_hints),
+            "occlusion_hints": occlusion_hints,
         },
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -902,6 +941,7 @@ def main():
     parser.add_argument("--ransac-px", type=float, default=3.0)
     parser.add_argument("--ratio", type=float, default=0.75)
     parser.add_argument("--illumination", action="store_true", help="approximate low-frequency lighting, not occlusion handling")
+    parser.add_argument("--no-occlusion-preservation", action="store_true", help="disable conservative foreground-preservation hints")
     parser.add_argument("--no-debug", action="store_true")
     parser.add_argument("--initialization-mode", choices=["vision_model", "manual_fallback", "reviewed_candidate"], default=None)
     parser.add_argument("--model", dest="model_name", default=None)
@@ -939,6 +979,7 @@ def main():
         model_name=args.model_name,
         surface_quads=surface_quads,
         asset_bindings=asset_bindings,
+        preserve_occlusion=not args.no_occlusion_preservation,
     )
     print(json.dumps(summary, indent=2))
 
