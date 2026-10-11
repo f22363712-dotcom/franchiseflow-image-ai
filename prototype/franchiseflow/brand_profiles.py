@@ -62,6 +62,7 @@ def create_profile(
     branch_labels: list[str],
     branch_sources: Iterable[Path],
     default_fit: str = "cover",
+    surface_policy: str = "review",
 ) -> dict[str, Any]:
     """Copy validated branch assets and write one durable profile manifest."""
     if not brand_name or len(brand_name) > 120:
@@ -70,6 +71,8 @@ def create_profile(
         raise ValueError("target_hint must be at most 500 characters")
     if default_fit not in {"cover", "contain"}:
         raise ValueError("default_fit must be cover or contain")
+    if surface_policy not in {"review", "all_surfaces"}:
+        raise ValueError("surface_policy must be review or all_surfaces")
     sources = [Path(item) for item in branch_sources]
     if not sources or len(sources) != len(branch_labels):
         raise ValueError("brand profile requires one label per branch asset")
@@ -95,6 +98,7 @@ def create_profile(
             "branch_labels": list(branch_labels),
             "branch_files": branch_files,
             "default_fit": default_fit,
+            "surface_policy": surface_policy,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         path = directory / "profile.json"

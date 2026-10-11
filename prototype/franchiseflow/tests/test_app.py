@@ -332,6 +332,46 @@ class FranchiseFlowAppTests(unittest.TestCase):
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
 
+    def test_brand_profile_all_surface_policy_maps_multi_surface_job(self):
+        profile_id = f"test_surfaces_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Multi Surface Brand",
+            "surface_policy": "all_surfaces",
+            "branches": [(_make_dummy_image("a"), "a.png"), (_make_dummy_image("b"), "b.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [
+                {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9},
+                {"quad": [[140, 20], [220, 20], [220, 80], [140, 80]], "confidence": 0.8},
+            ],
+        }
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        summary = {"frames": 4, "fps": 10.0, "failed_frames": [], "output_videos": []}
+        try:
+            created = self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data")
+            self.assertEqual(created.status_code, 201)
+            with patch("app.VisionClient", return_value=mock_instance), \
+                 patch("app.validate_candidate", return_value=accepted), \
+                 patch("app.run_tracker", return_value=summary) as tracker:
+                response = self.client.post(
+                    "/api/render",
+                    data={"video": (_make_two_scene_mp4(), "video.mp4"), "brand_profile_id": profile_id},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(response.status_code, 200)
+            bindings = tracker.call_args.kwargs["asset_bindings"]
+            self.assertEqual(len(bindings), 2)
+            self.assertEqual(len(bindings[0]["surface_ids"]), 4)
+            self.assertEqual(bindings[0]["surface_ids"], [
+                "scene_001_surface_001", "scene_001_surface_002",
+                "scene_002_surface_001", "scene_002_surface_002",
+            ])
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
     def test_create_job_persists_explicit_branch_labels(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),

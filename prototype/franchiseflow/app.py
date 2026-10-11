@@ -113,6 +113,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "branch_count": job.get("branch_count"),
         "brand_profile_id": job.get("brand_profile_id"),
         "brand_profile_default_fit": job.get("brand_profile_default_fit"),
+        "brand_profile_surface_policy": job.get("brand_profile_surface_policy"),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
         "target_hint": job.get("target_hint"),
@@ -464,6 +465,7 @@ def _create_job_from_request() -> dict[str, Any]:
         "target_hint": request.form.get("target_hint") or (brand_profile.get("target_hint") if brand_profile else None),
         "brand_profile_id": brand_profile_id,
         "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
+        "brand_profile_surface_policy": brand_profile.get("surface_policy") if brand_profile else None,
         "output_urls": [],
     })
     JOBS[job_id] = job
@@ -996,7 +998,10 @@ def _process_job(job_id: str) -> None:
         surface_ids = [surface["surface_id"] for scene in (scene_plan or []) for surface in scene.get("surfaces", [])]
         requires_explicit_bindings = any(len(scene.get("surfaces", [])) > 1 for scene in (scene_plan or []))
         profile_fit = job.get("brand_profile_default_fit")
-        if job.get("asset_bindings") is None and profile_fit in {"cover", "contain"} and surface_ids and not requires_explicit_bindings:
+        profile_surface_policy = job.get("brand_profile_surface_policy")
+        auto_map_all_surfaces = profile_surface_policy == "all_surfaces"
+        if (job.get("asset_bindings") is None and profile_fit in {"cover", "contain"} and surface_ids
+                and (not requires_explicit_bindings or auto_map_all_surfaces)):
             job["asset_bindings"] = [
                 {"branch_index": index, "surface_ids": surface_ids, "fit": profile_fit}
                 for index in range(1, len(sign_paths) + 1)
@@ -1137,6 +1142,7 @@ def create_brand_profile_endpoint():
         labels = _branch_labels(request.form.get("branch_labels"), branch_files)
         profile_id = (request.form.get("profile_id") or f"brand_{uuid.uuid4().hex[:10]}").strip()
         default_fit = request.form.get("default_fit", "cover")
+        surface_policy = request.form.get("surface_policy", "review")
         with tempfile.TemporaryDirectory(prefix="franchiseflow-profile-") as temporary:
             sources: list[Path] = []
             for index, branch in enumerate(branch_files, start=1):
@@ -1163,6 +1169,7 @@ def create_brand_profile_endpoint():
                 branch_labels=labels,
                 branch_sources=sources,
                 default_fit=default_fit,
+                surface_policy=surface_policy,
             )
     except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
