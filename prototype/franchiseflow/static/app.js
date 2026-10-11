@@ -318,7 +318,16 @@ document.addEventListener('DOMContentLoaded', () => {
     batchResults.hidden = false;
     const counts = batch.counts || {};
     const total = Number(counts.total || batch.requested_count || (batch.jobs || []).length || 0);
-    batchSummary.textContent = `批次 ${batch.batch_id || ''} · ${batchStatusLabel(batch.status)} · 已完成 ${counts.completed || 0}/${total} · 处理中 ${counts.running || 0} · 待复核 ${counts.needs_review || 0} · 失败 ${counts.failed || 0}`;
+    const summaryText = `批次 ${batch.batch_id || ''} · ${batchStatusLabel(batch.status)} · 已完成 ${counts.completed || 0}/${total} · 处理中 ${counts.running || 0} · 待复核 ${counts.needs_review || 0} · 失败 ${counts.failed || 0}`;
+    batchSummary.replaceChildren(document.createTextNode(summaryText));
+    if (batch.batch_id && Number(counts.completed || 0) > 0) {
+      const packageLink = document.createElement('a');
+      packageLink.className = 'batch-download-link';
+      packageLink.href = `/api/batches/${encodeURIComponent(batch.batch_id)}/download`;
+      packageLink.textContent = '下载已完成成片包';
+      packageLink.setAttribute('download', '');
+      batchSummary.append(document.createTextNode(' · '), packageLink);
+    }
     batchJobs.replaceChildren();
     (Array.isArray(batch.jobs) ? batch.jobs : []).forEach((job, index) => {
       const card = document.createElement('article');

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,8 +20,9 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, _locate_scenes, _normalise_candidate, _public_summary
+from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, BATCH_DIR, _locate_scenes, _normalise_candidate, _public_summary
 from job_store import create_job, load_job, save_job
+from batch_store import create_batch
 from scene_samples import sample_video_scenes
 
 
@@ -212,6 +214,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
             "/api/batches",
             "pollBatch",
             "/api/batches/${encodeURIComponent(batchId)}",
+            "/api/batches/${encodeURIComponent(batch.batch_id)}/download",
             "打开人工复核",
             "franchiseflow_batch_id",
         ):
@@ -420,6 +423,114 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(payload["counts"]["queued"], 2)
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_batch_download_packages_completed_children_and_audit_manifests(self):
+        batch_id = f"download_{uuid.uuid4().hex[:8]}"
+        completed_id = f"job_complete_{uuid.uuid4().hex[:8]}"
+        failed_id = f"job_failed_{uuid.uuid4().hex[:8]}"
+        completed_dir = OUTPUT_DIR / completed_id
+        failed_dir = OUTPUT_DIR / failed_id
+        try:
+            completed_dir.mkdir(parents=True, exist_ok=True)
+            video_path = completed_dir / "branch_1_store.mp4"
+            video_path.write_bytes(b"verified-video-artifact")
+            manifest = {
+                "job_id": completed_id,
+                "status": "completed",
+                "vision_audit": {"model": "gemini-3.1-flash-image", "candidate_count": 1},
+            }
+            (completed_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            create_job(OUTPUT_DIR, completed_id, {
+                "status": "completed",
+                "batch_id": batch_id,
+                "video_file": "shoot_a.mp4",
+                "branch_count": 1,
+                "branch_labels": ["store"],
+                "outputs": [f"/outputs/{completed_id}/{video_path.name}"],
+            })
+            create_job(OUTPUT_DIR, failed_id, {
+                "status": "failed",
+                "batch_id": batch_id,
+                "video_file": "shoot_b.mp4",
+                "error": "vision unavailable",
+                "outputs": [],
+            })
+            create_batch(BATCH_DIR, batch_id, {
+                "brand_profile_id": "north-star",
+                "requested_count": 2,
+                "job_ids": [completed_id, failed_id],
+            })
+
+            response = self.client.get(f"/api/batches/{batch_id}/download")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.mimetype, "application/zip")
+            with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+                names = set(archive.namelist())
+                self.assertIn("batch_manifest.json", names)
+                self.assertIn(f"jobs/{completed_id}/manifest.json", names)
+                self.assertIn(f"jobs/{completed_id}/outputs/{video_path.name}", names)
+                self.assertNotIn(f"jobs/{failed_id}/manifest.json", names)
+                package_manifest = json.loads(archive.read("batch_manifest.json"))
+                included = next(item for item in package_manifest["jobs"] if item["job_id"] == completed_id)
+                omitted = next(item for item in package_manifest["jobs"] if item["job_id"] == failed_id)
+                self.assertTrue(included["included"])
+                self.assertEqual(included["outputs"][0]["bytes"], video_path.stat().st_size)
+                self.assertEqual(len(included["outputs"][0]["sha256"]), 64)
+                self.assertFalse(omitted["included"])
+                self.assertEqual(package_manifest["included_job_count"], 1)
+                self.assertEqual(package_manifest["omitted_job_count"], 1)
+            response.close()
+            response.close()
+        finally:
+            shutil.rmtree(completed_dir, ignore_errors=True)
+            shutil.rmtree(failed_dir, ignore_errors=True)
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
+            try:
+                (BATCH_DIR / "packages" / f"{batch_id}.zip").unlink(missing_ok=True)
+            except PermissionError:
+                # Flask's Windows test client can still hold the send_file
+                # handle until the response object is collected.
+                pass
+
+    def test_batch_download_returns_conflict_until_a_completed_artifact_exists(self):
+        batch_id = f"download_pending_{uuid.uuid4().hex[:8]}"
+        job_id = f"job_pending_{uuid.uuid4().hex[:8]}"
+        try:
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "needs_review",
+                "batch_id": batch_id,
+                "video_file": "shoot.mp4",
+                "outputs": [],
+            })
+            create_batch(BATCH_DIR, batch_id, {"requested_count": 1, "job_ids": [job_id]})
+            response = self.client.get(f"/api/batches/{batch_id}/download")
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("no completed", response.get_json()["error"])
+            self.assertEqual(response.get_json()["batch"]["jobs"][0]["status"], "needs_review")
+        finally:
+            shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
+
+    def test_batch_download_rejects_completed_output_outside_child_directory(self):
+        batch_id = f"download_path_{uuid.uuid4().hex[:8]}"
+        job_id = f"job_path_{uuid.uuid4().hex[:8]}"
+        job_dir = OUTPUT_DIR / job_id
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "manifest.json").write_text("{}", encoding="utf-8")
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "completed",
+                "batch_id": batch_id,
+                "video_file": "shoot.mp4",
+                "outputs": [f"/outputs/{job_id}/../other.mp4"],
+            })
+            create_batch(BATCH_DIR, batch_id, {"requested_count": 1, "job_ids": [job_id]})
+            response = self.client.get(f"/api/batches/{batch_id}/download")
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("no completed", response.get_json()["error"])
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
 
 
     def test_brand_profile_default_fit_maps_single_surface(self):

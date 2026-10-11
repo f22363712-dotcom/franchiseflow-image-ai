@@ -200,6 +200,16 @@ body {
   margin-bottom: 0.75rem;
 }
 
+.batch-download-link {
+  color: var(--primary);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.batch-download-link:hover {
+  text-decoration: underline;
+}
+
 .batch-jobs {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));

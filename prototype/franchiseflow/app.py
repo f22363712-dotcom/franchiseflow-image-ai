@@ -15,7 +15,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 
 # Support imports from spikes/franchiseflow.
@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 from candidate_validator import validate_candidate
 from job_store import create_job, load_job, save_job
 from batch_store import create_batch, load_batch, save_batch
+from batch_delivery import BatchPackageError, build_batch_package
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
@@ -49,6 +50,8 @@ PROFILE_DIR = BASE_DIR / "brand_profiles"
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 BATCH_DIR = OUTPUT_DIR / "batches"
 BATCH_DIR.mkdir(parents=True, exist_ok=True)
+BATCH_PACKAGE_DIR = BATCH_DIR / "packages"
+BATCH_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -1488,6 +1491,45 @@ def get_batch_endpoint(batch_id: str):
     if batch is None:
         return jsonify({"error": "Batch not found"}), 404
     return jsonify(_batch_public(batch))
+
+
+@app.route("/api/batches/<batch_id>/download", methods=["GET"])
+def download_batch_endpoint(batch_id: str):
+    """Download a ZIP containing safe, completed child artifacts.
+
+    A batch can be partially delivered while other videos are queued or under
+    review.  Those children remain visible in ``batch_manifest.json`` but do
+    not contribute an MP4 to the archive.
+    """
+    if not JOB_ID_RE.fullmatch(batch_id or ""):
+        return jsonify({"error": "Batch not found"}), 404
+    try:
+        batch = load_batch(BATCH_DIR, batch_id)
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if batch is None:
+        return jsonify({"error": "Batch not found"}), 404
+    public_batch = _batch_public(batch)
+    jobs = {job_id: _job(job_id) for job_id in public_batch.get("job_ids", [])}
+    try:
+        package_path, package_manifest = build_batch_package(
+            public_batch,
+            jobs,
+            OUTPUT_DIR,
+            BATCH_PACKAGE_DIR,
+        )
+    except BatchPackageError as exc:
+        return jsonify({"error": str(exc), "batch": public_batch}), 409
+    response = send_file(
+        str(package_path),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"franchiseflow-{batch_id}.zip",
+        max_age=0,
+    )
+    response.headers["X-FranchiseFlow-Included-Jobs"] = str(package_manifest["included_job_count"])
+    response.headers["X-FranchiseFlow-Omitted-Jobs"] = str(package_manifest["omitted_job_count"])
+    return response
 
 
 @app.route("/api/batches", methods=["GET"])
