@@ -61,17 +61,24 @@ def _iter_multidict_items(mapping: Any) -> Iterable[tuple[str, str]]:
             yield key, "" if value is None else str(value)
 
 
-def _read_file_bytes(file_item: Any) -> bytes:
+def _hash_file_stream(file_item: Any) -> tuple[int, str]:
     stream = getattr(file_item, "stream", None)
     if stream is None:
         raise IdempotencyError("Idempotency-Key requires replayable uploaded files")
     try:
         position = stream.tell()
-        content = stream.read()
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
         stream.seek(position)
     except (AttributeError, OSError, ValueError) as exc:
         raise IdempotencyError("Idempotency-Key requires replayable uploaded files") from exc
-    return bytes(content or b"")
+    return size, digest.hexdigest()
 
 
 def request_fingerprint(request: Any, scope: str) -> str:
@@ -90,13 +97,13 @@ def request_fingerprint(request: Any, scope: str) -> str:
         for file_item in request.files.getlist(field):
             filename = str(getattr(file_item, "filename", "") or "")
             content_type = str(getattr(file_item, "content_type", "") or "")
-            body = _read_file_bytes(file_item)
+            size, digest = _hash_file_stream(file_item)
             payload["files"].append({
                 "field": field,
                 "filename": filename,
                 "content_type": content_type,
-                "size": len(body),
-                "sha256": hashlib.sha256(body).hexdigest(),
+                "size": size,
+                "sha256": digest,
             })
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
