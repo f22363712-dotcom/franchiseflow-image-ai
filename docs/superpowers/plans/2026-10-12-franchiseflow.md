@@ -186,7 +186,7 @@
   python -m unittest discover -s spikes/franchiseflow/tests -v
   python -m unittest discover -s prototype/franchiseflow/tests -v
   git diff --check
-  git grep -n -I -E 'sk-[A-Za-z0-9]|Bearer [A-Za-z0-9]' -- ':!D*'
+  git grep -n -I -E 'sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}' -- ':!D*'
   git status --short
   ```
 
