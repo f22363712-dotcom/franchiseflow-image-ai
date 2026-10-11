@@ -7,7 +7,7 @@
 默认配置为：
 
 - API 地址：通过 `BANANA_API_BASE_URL` 设置，默认 `https://e.c.h-e.top/v1`
-- 模型：`GLM-5.3-flash`
+- 模型：`gemini-3.1-flash-image`，由 `BANANA_VISION_MODEL` 覆盖
 - 密钥：只从 `BANANA_API_KEY` 环境变量读取
 
 ## 本机连接测试
