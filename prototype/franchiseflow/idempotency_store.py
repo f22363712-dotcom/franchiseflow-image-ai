@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -163,7 +164,16 @@ class IdempotencyStore:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, self.path)
+            # A browser or scanner can briefly hold the index open on
+            # Windows. Retry the atomic swap before reporting storage loss.
+            for attempt in range(5):
+                try:
+                    os.replace(temp_name, self.path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
         finally:
             try:
                 os.unlink(temp_name)

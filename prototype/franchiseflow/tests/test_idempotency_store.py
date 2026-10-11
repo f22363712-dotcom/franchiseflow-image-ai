@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from werkzeug.datastructures import MultiDict
 
 import sys
@@ -66,6 +66,21 @@ class IdempotencyStoreTests(unittest.TestCase):
         content = json.loads((self.root / "idempotency.json").read_text(encoding="utf-8"))
         self.assertEqual(content["version"], 1)
         self.assertEqual(list(content["entries"])[0].split("\u0000"), ["jobs", "request-1"])
+
+    def test_put_retries_transient_windows_replace_error(self):
+        real_replace = __import__("os").replace
+        calls = {"count": 0}
+
+        def flaky_replace(source, destination):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PermissionError("temporary sharing violation")
+            return real_replace(source, destination)
+
+        with patch("idempotency_store.os.replace", side_effect=flaky_replace):
+            self.store.put("jobs", "request-1", "fp-1", "job123")
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(self.store.get("jobs", "request-1")["resource_id"], "job123")
 
 
 if __name__ == "__main__":
