@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FranchiseFlow - 门店多分支视频智能合成</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app-background"></div>
+
+  <header class="app-header">
+    <div class="header-container">
+      <div class="brand">
+        <div class="brand-logo">FF</div>
+        <div class="brand-info">
+          <h1>FranchiseFlow</h1>
+          <span class="brand-tag">Planar Vision AI + Geometry Tracking</span>
+        </div>
+      </div>
+      <div class="header-badges">
+        <span class="badge badge-tech" id="tech-badge">GLM-5.3-flash + OpenCV SIFT</span>
+        <span class="badge badge-status" id="system-badge">System Ready</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-container">
+    <section class="hero-section">
+      <h2 class="hero-title">一条移动门店视频 · 自动化多分支变体成片</h2>
+      <p class="hero-desc">首帧视觉大模型定位招牌平面，本地高保真 SIFT/RANSAC 几何透视跟踪，并行渲染多分支品牌独立视频。</p>
+    </section>
+
+    <!-- Upload & Config Grid -->
+    <div class="grid-layout">
+      <!-- Left Panel: Input Controls -->
+      <section class="card panel-input">
+        <div class="card-header">
+          <h3 class="card-title">1. 上传素材与配置</h3>
+          <span class="card-subtitle">单视频 + 三分支素材</span>
+        </div>
+
+        <form id="render-form" class="render-form">
+          <div class="form-group">
+            <label class="form-label" for="video-input">
+              <span>门店移动视频 (MP4)</span>
+              <span class="label-hint">推荐 720p 移动运镜</span>
+            </label>
+            <div class="drop-zone" id="video-dropzone">
+              <input type="file" id="video-input" name="video" accept=".mp4" required>
+              <div class="dropzone-content" id="video-dropzone-content">
+                <svg class="icon-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                </svg>
+                <div class="drop-text" id="video-file-name">拖拽或点击上传 MP4 视频</div>
+                <div class="drop-sub">支持常见 H.264 MP4 格式</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">
+              <span>三分支招牌素材 (PNG/JPG)</span>
+              <span class="label-hint">必须提供 3 张</span>
+            </label>
+            <div class="branches-grid">
+              <div class="branch-upload-box" id="branch-box-1">
+                <label for="branch-input-1" class="branch-label">分支 1 (如滨河路店)</label>
+                <input type="file" id="branch-input-1" name="branch_1" accept="image/png,image/jpeg" required>
+                <div class="branch-file-name" id="branch-name-1">选择图片 1</div>
+              </div>
+              <div class="branch-upload-box" id="branch-box-2">
+                <label for="branch-input-2" class="branch-label">分支 2 (如市中心店)</label>
+                <input type="file" id="branch-input-2" name="branch_2" accept="image/png,image/jpeg" required>
+                <div class="branch-file-name" id="branch-name-2">选择图片 2</div>
+              </div>
+              <div class="branch-upload-box" id="branch-box-3">
+                <label for="branch-input-3" class="branch-label">分支 3 (如北园店)</label>
+                <input type="file" id="branch-input-3" name="branch_3" accept="image/png,image/jpeg" required>
+                <div class="branch-file-name" id="branch-name-3">选择图片 3</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mode Selection -->
+          <div class="form-group config-group">
+            <label class="form-label">初始化模式</label>
+            <div class="toggle-container">
+              <label class="toggle-option">
+                <input type="radio" name="init_mode_radio" value="vision" id="mode-vision" checked>
+                <span class="toggle-label">GLM-5.3-flash 视觉模型</span>
+              </label>
+              <label class="toggle-option">
+                <input type="radio" name="init_mode_radio" value="manual" id="mode-manual">
+                <span class="toggle-label">手动基线兜底 (Manual Fallback)</span>
+              </label>
+            </div>
+            <p class="mode-tip" id="mode-tip">优先调用 GLM 视觉接口一次性自动定位；若网关 403 则可切回手动兜底。</p>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" id="btn-submit" class="btn btn-primary">
+              <span class="btn-text">开始跟踪与分支合成</span>
+              <span class="btn-spinner" id="btn-spinner" style="display:none;"></span>
+            </button>
+            <button type="button" id="btn-load-sample" class="btn btn-secondary">载入默认样例素材</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Right Panel: Visualizer & Live Metrics -->
+      <section class="card panel-preview">
+        <div class="card-header">
+          <h3 class="card-title">2. 招牌平面定位与指标</h3>
+          <span class="badge" id="quad-status-badge">等待处理</span>
+        </div>
+
+        <div class="preview-stage-container">
+          <div class="canvas-wrapper" id="canvas-wrapper">
+            <div class="placeholder-preview" id="placeholder-preview">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="icon-camera">
+                <rect x="2" y="2" width="20" height="20" rx="4"/>
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M7 7h.01"/>
+              </svg>
+              <span>首帧招牌定位四角将在此实时投影</span>
+            </div>
+            <canvas id="preview-canvas" style="display:none;"></canvas>
+          </div>
+        </div>
+
+        <div class="metrics-panel" id="metrics-panel">
+          <div class="metrics-grid">
+            <div class="metric-item">
+              <span class="metric-label">处理总帧数</span>
+              <span class="metric-value" id="metric-frames">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">耗时 / 处理速度</span>
+              <span class="metric-value" id="metric-time">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">中位 SIFT 内点数</span>
+              <span class="metric-value" id="metric-inliers">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">重投影中位残差</span>
+              <span class="metric-value" id="metric-reproj">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">失败帧数</span>
+              <span class="metric-value" id="metric-failed">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">初始化途径</span>
+              <span class="metric-value" id="metric-init-mode">-</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Output Section: 3 Branch Videos -->
+    <section class="card output-section" id="output-section">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">3. 分支渲染结果预览 (三路同步导出)</h3>
+          <span class="card-subtitle">每一帧根据估计单应矩阵进行亚像素透视合成，失败帧自动保底原片</span>
+        </div>
+      </div>
+
+      <div class="outputs-grid" id="outputs-grid">
+        <div class="output-card" id="output-card-1">
+          <div class="output-card-header">
+            <span class="branch-tag">Branch 1</span>
+            <span class="branch-title" id="output-title-1">分支门店 1</span>
+          </div>
+          <div class="video-container">
+            <video id="video-player-1" controls playsinline loop></video>
+          </div>
+          <div class="output-actions">
+            <a id="download-link-1" class="btn btn-outline" download>下载成片 MP4</a>
+          </div>
+        </div>
+
+        <div class="output-card" id="output-card-2">
+          <div class="output-card-header">
+            <span class="branch-tag">Branch 2</span>
+            <span class="branch-title" id="output-title-2">分支门店 2</span>
+          </div>
+          <div class="video-container">
+            <video id="video-player-2" controls playsinline loop></video>
+          </div>
+          <div class="output-actions">
+            <a id="download-link-2" class="btn btn-outline" download>下载成片 MP4</a>
+          </div>
+        </div>
+
+        <div class="output-card" id="output-card-3">
+          <div class="output-card-header">
+            <span class="branch-tag">Branch 3</span>
+            <span class="branch-title" id="output-title-3">分支门店 3</span>
+          </div>
+          <div class="video-container">
+            <video id="video-player-3" controls playsinline loop></video>
+          </div>
+          <div class="output-actions">
+            <a id="download-link-3" class="btn btn-outline" download>下载成片 MP4</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <div class="footer-container">
+      <span>FranchiseFlow · Hackathon Demo Prototype</span>
+      <span>Model: GLM-5.3-flash | CV: OpenCV SIFT & PyrLK</span>
+    </div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

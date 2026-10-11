@@ -12,9 +12,12 @@ spikes/franchiseflow/fixtures/grid.jpg
 spikes/franchiseflow/fixtures/demo_cut.mp4
 
 
-# Local prototype artifacts from earlier experiments
+# Local prototype artifacts
 prototype/adsafezone/uploads/
 prototype/adsafezone/outputs/
+prototype/franchiseflow/uploads/
+prototype/franchiseflow/outputs/
+
 
 # OS/editor files
 .DS_Store
