@@ -73,12 +73,40 @@
           <div class="form-group">
             <label class="form-label" for="brand-profile-input">
               <span>复用品牌配置（可选）</span>
-              <span class="label-hint">先通过 API 创建配置</span>
+              <span class="label-hint">可在此页保存或复用</span>
             </label>
             <input id="brand-profile-input" name="brand_profile_id" class="text-input" type="text" maxlength="64" list="brand-profile-options" placeholder="例如：north-star">
             <datalist id="brand-profile-options"></datalist>
             <p class="mode-tip" id="brand-profile-status">正在读取本地品牌配置…</p>
-            <p class="mode-tip">填写后会沿用配置中的分店图片、标签和识别提示，本次不要再上传分支图片。</p>
+            <p class="mode-tip">填写后会沿用配置中的分店图片、标签和识别提示，本次不要再上传分支图片。没有配置时可用下面的表单保存当前分支素材。</p>
+          </div>
+
+          <div class="form-group config-group" id="brand-profile-save-panel">
+            <label class="form-label">
+              <span>保存为品牌配置</span>
+              <span class="label-hint">把当前分支图片保存下来，后续任务只选配置 ID</span>
+            </label>
+            <div class="profile-save-grid">
+              <input id="profile-save-name" class="text-input" type="text" maxlength="120" placeholder="品牌名称，例如 North Star Coffee">
+              <input id="profile-save-id" class="text-input" type="text" maxlength="64" placeholder="配置 ID（可选，例如 north-star）">
+              <input id="profile-save-labels" class="text-input" type="text" placeholder="分支标签（可选，用逗号分隔）">
+              <select id="profile-save-fit" class="text-input" aria-label="默认素材适配">
+                <option value="cover">铺满招牌平面（cover）</option>
+                <option value="contain">保留素材比例（contain）</option>
+              </select>
+              <select id="profile-save-surface-policy" class="text-input" aria-label="多平面策略">
+                <option value="review">多平面逐次复核（推荐）</option>
+                <option value="all_surfaces">把每个分支应用到全部平面</option>
+              </select>
+              <select id="profile-save-scene-policy" class="text-input" aria-label="跨镜头策略">
+                <option value="vision_each_scene">每个镜头重新定位（稳妥）</option>
+                <option value="reuse_if_verified">先复用已验证候选，失败再重定位</option>
+              </select>
+            </div>
+            <div class="profile-save-actions">
+              <button type="button" id="btn-save-brand-profile" class="btn btn-secondary">保存当前分支为品牌配置</button>
+              <span class="mode-tip" id="brand-profile-save-status">需要先上传至少一张分支图片；标签留空时使用文件名。</span>
+            </div>
           </div>
 
           <div class="form-group">

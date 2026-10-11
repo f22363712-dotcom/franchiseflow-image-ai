@@ -226,6 +226,23 @@ body {
   outline-offset: 1px;
 }
 
+.profile-save-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.profile-save-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.profile-save-actions .mode-tip {
+  margin-top: 0;
+}
+
 .form-label {
   display: flex;
   justify-content: space-between;
@@ -332,6 +349,17 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@media (max-width: 720px) {
+  .profile-save-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .profile-save-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 
 .config-group {

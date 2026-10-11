@@ -35,6 +35,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const brandProfileInput = document.getElementById('brand-profile-input');
   const brandProfileOptions = document.getElementById('brand-profile-options');
   const brandProfileStatus = document.getElementById('brand-profile-status');
+  const saveBrandProfileButton = document.getElementById('btn-save-brand-profile');
+  const profileSaveName = document.getElementById('profile-save-name');
+  const profileSaveId = document.getElementById('profile-save-id');
+  const profileSaveLabels = document.getElementById('profile-save-labels');
+  const profileSaveFit = document.getElementById('profile-save-fit');
+  const profileSaveSurfacePolicy = document.getElementById('profile-save-surface-policy');
+  const profileSaveScenePolicy = document.getElementById('profile-save-scene-policy');
+  const profileSaveStatus = document.getElementById('brand-profile-save-status');
 
   let branchInputs = [];
   let activeJobId = null;
@@ -51,6 +59,16 @@ document.addEventListener('DOMContentLoaded', () => {
   let previewRenderToken = 0;
   let brandProfiles = new Map();
 
+  function renderBrandProfileOptions() {
+    if (!brandProfileOptions) return;
+    brandProfileOptions.replaceChildren(...[...brandProfiles.values()].map(profile => {
+      const option = document.createElement('option');
+      option.value = String(profile.profile_id);
+      option.label = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).length} 个分店`;
+      return option;
+    }));
+  }
+
   async function loadBrandProfiles() {
     if (!brandProfileOptions) return;
     try {
@@ -58,12 +76,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取品牌配置失败');
       brandProfiles = new Map((payload.profiles || []).map(profile => [String(profile.profile_id), profile]));
-      brandProfileOptions.replaceChildren(...[...brandProfiles.values()].map(profile => {
-        const option = document.createElement('option');
-        option.value = String(profile.profile_id);
-        option.label = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).length} 个分店`;
-        return option;
-      }));
+      renderBrandProfileOptions();
       if (brandProfileStatus) brandProfileStatus.textContent = brandProfiles.size ? `已载入 ${brandProfiles.size} 个本地配置，可从列表选择。` : '暂无本地配置，可直接上传分支图片。';
     } catch (error) {
       if (brandProfileStatus) brandProfileStatus.textContent = '品牌配置列表暂时不可用，可继续直接上传分支图片。';
@@ -128,6 +141,75 @@ document.addEventListener('DOMContentLoaded', () => {
 
   for (let i = 0; i < 3; i++) addBranchInput();
   addBranchButton.addEventListener('click', addBranchInput);
+
+  function clearUploadedBranches() {
+    branchInputs.forEach(input => {
+      input.value = '';
+      const name = input.closest('.branch-upload-box')?.querySelector('.branch-file-name');
+      if (name) name.textContent = `选择图片 ${input.closest('.branch-upload-box')?.dataset.index || ''}`;
+    });
+  }
+
+  function setProfileSaveStatus(text, tone = 'muted') {
+    if (!profileSaveStatus) return;
+    profileSaveStatus.textContent = text;
+    profileSaveStatus.style.color = tone === 'error' ? 'var(--danger)' : tone === 'success' ? 'var(--success)' : '';
+  }
+
+  async function saveCurrentBrandProfile() {
+    const files = branchInputs.map(input => input.files[0]).filter(Boolean);
+    const brandName = profileSaveName ? profileSaveName.value.trim() : '';
+    if (!brandName) {
+      setProfileSaveStatus('请先填写品牌名称。', 'error');
+      profileSaveName?.focus();
+      return;
+    }
+    if (brandProfileInput?.value.trim()) {
+      setProfileSaveStatus('当前已选品牌配置，请先清空配置 ID，再保存新的分支素材。', 'error');
+      return;
+    }
+    if (!files.length) {
+      setProfileSaveStatus('请先上传至少一张分支图片。', 'error');
+      return;
+    }
+    const labels = (profileSaveLabels?.value || '')
+      .split(/[,，]/)
+      .map(label => label.trim())
+      .filter(Boolean);
+    if (labels.length && labels.length !== files.length) {
+      setProfileSaveStatus(`分支标签有 ${labels.length} 个，但图片有 ${files.length} 张，请逐一对应。`, 'error');
+      return;
+    }
+    const payload = new FormData();
+    payload.append('brand_name', brandName);
+    if (profileSaveId?.value.trim()) payload.append('profile_id', profileSaveId.value.trim());
+    const targetHint = document.getElementById('target-hint-input');
+    if (targetHint?.value.trim()) payload.append('target_hint', targetHint.value.trim());
+    if (labels.length) payload.append('branch_labels', JSON.stringify(labels));
+    payload.append('default_fit', profileSaveFit?.value || 'cover');
+    payload.append('surface_policy', profileSaveSurfacePolicy?.value || 'review');
+    payload.append('scene_reuse_policy', profileSaveScenePolicy?.value || 'vision_each_scene');
+    files.forEach(file => payload.append('branches', file));
+    saveBrandProfileButton.disabled = true;
+    setProfileSaveStatus('正在保存品牌图片和策略…');
+    try {
+      const response = await fetch('/api/brand-profiles', { method: 'POST', body: payload });
+      const profile = await response.json();
+      if (!response.ok) throw new Error(profile.error || `保存失败（HTTP ${response.status}）`);
+      brandProfiles.set(String(profile.profile_id), profile);
+      renderBrandProfileOptions();
+      if (brandProfileInput) brandProfileInput.value = String(profile.profile_id);
+      updateBrandProfileStatus();
+      clearUploadedBranches();
+      setProfileSaveStatus(`已保存 ${profile.brand_name || profile.profile_id}，现在可以直接提交视频任务。`, 'success');
+    } catch (error) {
+      setProfileSaveStatus(error.message || '保存品牌配置失败。', 'error');
+    } finally {
+      saveBrandProfileButton.disabled = false;
+    }
+  }
+
+  saveBrandProfileButton && saveBrandProfileButton.addEventListener('click', saveCurrentBrandProfile);
 
   videoInput.addEventListener('change', () => {
     if (videoInput.files[0]) {
