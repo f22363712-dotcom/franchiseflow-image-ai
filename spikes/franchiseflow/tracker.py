@@ -7,6 +7,7 @@ Dependencies: Python, opencv-python (SIFT), numpy, Pillow.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -129,9 +130,14 @@ def probe_output_contract(
         problems.append(f"audio_present={audio_present}, expected={require_audio}")
     if problems:
         raise RuntimeError(f"output validation failed for {path.name}: " + "; ".join(problems))
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "file": path.name,
         "validated": True,
+        "sha256": digest.hexdigest(),
         "codec": codec,
         "pix_fmt": pixel_format,
         "width": width,

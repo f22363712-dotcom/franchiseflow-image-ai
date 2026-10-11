@@ -110,6 +110,7 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertEqual(len(summary["output_videos"]), 3)
         self.assertTrue(all(item["validated"] for item in summary["output_validation"]))
         self.assertTrue(all(item["codec"] == "h264" and item["pix_fmt"] == "yuv420p" for item in summary["output_validation"]))
+        self.assertTrue(all(len(item["sha256"]) == 64 for item in summary["output_validation"]))
 
         # Verify summary.json and tracking.jsonl
         self.assertTrue((out_dir / "summary.json").exists())
