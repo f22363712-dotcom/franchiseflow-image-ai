@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate, _public_summary
+from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, _normalise_candidate, _public_summary
 from job_store import create_job, load_job, save_job
 from scene_samples import sample_video_scenes
 
@@ -187,6 +187,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn("sample_preview", app_js)
         self.assertIn("redrawReview", app_js)
         self.assertIn("quality-review", app_js)
+        self.assertIn("brand_profile_id", app_js)
 
     def test_quality_review_can_accept_or_reject_rendered_batch(self):
         accepted_id = f"quality_accept_test_{uuid.uuid4().hex[:6]}"
@@ -249,6 +250,87 @@ class FranchiseFlowAppTests(unittest.TestCase):
         get_res = self.client.get(f"/api/jobs/{payload['job_id']}")
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
+
+    def test_brand_profile_can_be_created_and_listed(self):
+        profile_id = f"test_brand_{uuid.uuid4().hex[:8]}"
+        data = {
+            "profile_id": profile_id,
+            "brand_name": "North Star Coffee",
+            "target_hint": "dark charcoal fascia with white wordmark",
+            "branch_labels": json.dumps(["滨河路店", "市中心店"], ensure_ascii=False),
+            "branches": [(_make_dummy_image("one"), "one.png"), (_make_dummy_image("two"), "two.png")],
+        }
+        try:
+            response = self.client.post("/api/brand-profiles", data=data, content_type="multipart/form-data")
+            self.assertEqual(response.status_code, 201)
+            profile = response.get_json()
+            self.assertEqual(profile["profile_id"], profile_id)
+            self.assertEqual(profile["branch_labels"], ["滨河路店", "市中心店"])
+            self.assertEqual(len(profile["branch_files"]), 2)
+            listed = self.client.get("/api/brand-profiles").get_json()["profiles"]
+            self.assertTrue(any(item["profile_id"] == profile_id for item in listed))
+            fetched = self.client.get(f"/api/brand-profiles/{profile_id}")
+            self.assertEqual(fetched.status_code, 200)
+            self.assertEqual(fetched.get_json()["target_hint"], "dark charcoal fascia with white wordmark")
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_job_reuses_brand_profile_without_branch_uploads(self):
+        profile_id = f"test_reuse_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Reusable Brand",
+            "branch_labels": json.dumps(["A 店", "B 店"], ensure_ascii=False),
+            "branches": [(_make_dummy_image("a"), "a.png"), (_make_dummy_image("b"), "b.png")],
+        }
+        try:
+            created_profile = self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data")
+            self.assertEqual(created_profile.status_code, 201)
+            job_data = {"video": (_make_dummy_mp4(), "video.mp4"), "brand_profile_id": profile_id}
+            with patch("app._submit_job") as submit:
+                response = self.client.post("/api/jobs", data=job_data, content_type="multipart/form-data")
+            self.assertEqual(response.status_code, 202)
+            job = response.get_json()
+            self.assertEqual(job["brand_profile_id"], profile_id)
+            self.assertEqual(job["branch_labels"], ["A_店", "B_店"])
+            self.assertEqual(job["branch_count"], 2)
+            self.assertTrue((UPLOAD_DIR / job["job_id"] / "branch_1.png").exists())
+            submit.assert_called_once_with(job["job_id"])
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_brand_profile_default_fit_maps_single_surface(self):
+        profile_id = f"test_fit_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Fit Brand",
+            "default_fit": "contain",
+            "branches": [(_make_dummy_image("a"), "a.png"), (_make_dummy_image("b"), "b.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [{"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9}],
+        }
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        summary = {"frames": 2, "fps": 10.0, "failed_frames": [], "output_videos": []}
+        try:
+            created = self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data")
+            self.assertEqual(created.status_code, 201)
+            with patch("app.VisionClient", return_value=mock_instance), \
+                 patch("app.validate_candidate", return_value=accepted), \
+                 patch("app.run_tracker", return_value=summary) as tracker:
+                response = self.client.post(
+                    "/api/render",
+                    data={"video": (_make_dummy_mp4(), "video.mp4"), "brand_profile_id": profile_id},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(response.status_code, 200)
+            bindings = tracker.call_args.kwargs["asset_bindings"]
+            self.assertEqual(len(bindings), 2)
+            self.assertTrue(all(item["fit"] == "contain" for item in bindings))
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
 
     def test_create_job_persists_explicit_branch_labels(self):
         data = {

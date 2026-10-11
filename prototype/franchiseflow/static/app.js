@@ -510,10 +510,14 @@ document.addEventListener('DOMContentLoaded', () => {
     event.preventDefault();
     const files = branchInputs.map(input => input.files[0]).filter(Boolean);
     if (!videoInput.files[0]) return alert('请先选择门店视频');
-    if (!files.length) return alert('请至少选择一张分支招牌图片');
+    const brandProfileInput = document.getElementById('brand-profile-input');
+    const brandProfileId = brandProfileInput ? brandProfileInput.value.trim() : '';
+    if (!brandProfileId && !files.length) return alert('请至少选择一张分支招牌图片，或填写品牌配置 ID');
+    if (brandProfileId && files.length) return alert('使用品牌配置时请清空本次上传的分支图片');
     const formData = new FormData();
     formData.append('video', videoInput.files[0]);
-    files.forEach(file => formData.append('branches', file));
+    if (!brandProfileId) files.forEach(file => formData.append('branches', file));
+    if (brandProfileId) formData.append('brand_profile_id', brandProfileId);
     const targetHint = document.getElementById('target-hint-input');
     if (targetHint && targetHint.value.trim()) formData.append('target_hint', targetHint.value.trim());
     const manual = document.getElementById('mode-manual').checked;

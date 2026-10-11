@@ -71,6 +71,15 @@
           </div>
 
           <div class="form-group">
+            <label class="form-label" for="brand-profile-input">
+              <span>复用品牌配置（可选）</span>
+              <span class="label-hint">先通过 API 创建配置</span>
+            </label>
+            <input id="brand-profile-input" name="brand_profile_id" class="text-input" type="text" maxlength="64" placeholder="例如：north-star">
+            <p class="mode-tip">填写后会沿用配置中的分店图片、标签和识别提示，本次不要再上传分支图片。</p>
+          </div>
+
+          <div class="form-group">
             <label class="form-label">
               <span>分支招牌素材 (PNG/JPG)</span>
               <span class="label-hint">至少 1 张，最多 10 张</span>

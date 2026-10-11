@@ -88,6 +88,24 @@ python spikes/franchiseflow/tracker.py \
 
 跟踪器已经提供最多四个独立平面的实验参数 `--surface-quad-json` 和 `--asset-binding-json`。Web 任务使用最多八个场景的清单，每个场景最多四个平面。每个平面拥有自己的 SIFT/RANSAC/LK 跟踪器，单个平面失效时只保留该平面的原画，其他平面继续处理。一个分支可以显式引用多个平面，多个分支也可以分别引用同一个平面。场景清单会记录 `transition_type`，目前 `dissolve` 只覆盖短窗口、全画面颜色变化明显的简单转场，复杂转场仍可能合并到同一场景并进入质量复核。`asset_bindings.fit` 支持 `cover` 和 `contain`，前者铺满平面，后者保留素材宽高比并在平面内留出透明边界。高置信度遮挡提示会保留原始前景像素并写入摘要，系统仍不声称具备通用视频抠像或跨镜头自动匹配能力。
 
+## Brand profiles
+
+重复使用同一品牌的分店招牌时，可以先创建本地品牌配置。配置只保存品牌提示词、分店标签和图片副本，不保存 API key，也不把本机绝对路径写进响应。
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/brand-profiles \
+  -F 'profile_id=north-star' \
+  -F 'brand_name=North Star Coffee' \
+  -F 'target_hint=dark charcoal fascia with white wordmark' \
+  -F 'branch_labels=["滨河路店","市中心店"]' \
+  -F 'branches=@assets/riverside.png' \
+  -F 'branches=@assets/downtown.png'
+```
+
+创建任务时只上传视频并传 `brand_profile_id=north-star`，系统会复制配置中的图片到任务目录，并沿用标签和 `target_hint`。一次任务可以继续直接上传 `branches`，两种方式不能混用，避免分店顺序产生歧义。配置目录默认在 `prototype/franchiseflow/brand_profiles/`，已加入 Git 忽略规则。
+
+配置还可以带 `default_fit=contain`。当每个场景只有一个通过验证的平面时，系统会自动把这个素材适配策略写入每个分支；多平面场景仍要求显式 `asset_bindings`，避免猜错素材与平面的关系。
+
 ## Tests
 
 ```bash

@@ -90,6 +90,7 @@ python prototype/franchiseflow/app.py
   - 分支素材：`spikes/franchiseflow/assets/` 下的三张图片（`riverside.png`、`downtown.png`、`northpark.png`）
 - 模式：可选“视觉模型模式”或“手动基线兜底”。任务列表可通过 `GET /api/jobs?status=needs_review` 找回待复核作业。
 - 断网多镜头任务可在 `POST /api/jobs` 传入 `manual_scene_quads`，按检测场景顺序提供四角。每个场景仍需通过多帧纹理与单应性验证，长度不符或验证失败会停在 `needs_review`。
+- 可通过 `POST /api/brand-profiles` 保存品牌提示词、分店标签和招牌图片；后续任务只传 `brand_profile_id` 和视频即可复用，任务清单会记录配置 ID 与素材适配策略。
 
 ### 4.2 运行全量自动化测试
 ```powershell

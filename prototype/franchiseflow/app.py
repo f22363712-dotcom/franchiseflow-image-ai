@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from candidate_validator import validate_candidate
 from job_store import create_job, load_job, save_job
+from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from vision_client import VisionClient
@@ -41,6 +43,8 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PROFILE_DIR = BASE_DIR / "brand_profiles"
+PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -57,6 +61,7 @@ JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_SURFACES_PER_SCENE = 4
 SURFACE_OVERLAP_THRESHOLD = 0.25
+MAX_PROFILE_COUNT = 100
 
 # Reject oversized multipart bodies before Werkzeug spools them to disk. The
 # small allowance covers multipart headers and form fields; the exact payload
@@ -106,6 +111,8 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "branch_files": job.get("branch_files", []),
         "branch_labels": job.get("branch_labels", []),
         "branch_count": job.get("branch_count"),
+        "brand_profile_id": job.get("brand_profile_id"),
+        "brand_profile_default_fit": job.get("brand_profile_default_fit"),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
         "target_hint": job.get("target_hint"),
@@ -274,7 +281,12 @@ def _branch_files(request_files) -> list[Any]:
     return branches
 
 
-def _branch_labels(raw_value: str | None, branch_files: list[Any]) -> list[str]:
+def _source_filename(item: Any) -> str:
+    filename = getattr(item, "filename", None)
+    return str(filename) if filename else Path(item).name
+
+
+def _branch_labels(raw_value: str | None, branch_files: list[Any], default_labels: list[str] | None = None) -> list[str]:
     """Read optional human labels while keeping uploaded filenames as a fallback."""
     labels = None
     if raw_value:
@@ -283,9 +295,9 @@ def _branch_labels(raw_value: str | None, branch_files: list[Any]) -> list[str]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid branch_labels JSON: {exc}") from exc
     if labels is None:
-        labels = [Path(item.filename).stem for item in branch_files]
+        labels = default_labels or [Path(_source_filename(item)).stem for item in branch_files]
     try:
-        return normalize_branch_labels(labels, [Path(item.filename) for item in branch_files])
+        return normalize_branch_labels(labels, [Path(_source_filename(item)) for item in branch_files])
     except ValueError as exc:
         raise ValueError(f"Invalid branch_labels: {exc}") from exc
 
@@ -314,13 +326,28 @@ def _create_job_from_request() -> dict[str, Any]:
         allowed = ", ".join(sorted(ALLOWED_VIDEO_EXTS))
         raise ValueError(f"Video must use a supported video extension: {allowed}")
 
+    brand_profile_id = request.form.get("brand_profile_id") or None
+    brand_profile = None
+    if brand_profile_id:
+        try:
+            brand_profile = load_profile(PROFILE_DIR, brand_profile_id)
+        except (ValueError, RuntimeError) as exc:
+            raise ValueError(str(exc)) from exc
+        if brand_profile is None:
+            raise ValueError(f"brand profile not found: {brand_profile_id}")
     branch_files = _branch_files(request.files)
+    if brand_profile and branch_files:
+        raise ValueError("brand_profile_id cannot be combined with branch uploads")
+    if brand_profile:
+        branch_files = profile_asset_paths(PROFILE_DIR, brand_profile)
     if not 1 <= len(branch_files) <= MAX_BRANCHES:
         raise ValueError(f"1 to 10 branch image assets required, got {len(branch_files)}")
     for branch in branch_files:
-        if Path(branch.filename).suffix.lower() not in ALLOWED_IMAGE_EXTS:
-            raise ValueError(f"Branch image {branch.filename} has unsupported extension")
-    branch_labels = _branch_labels(request.form.get("branch_labels"), branch_files)
+        filename = _source_filename(branch)
+        if Path(filename).suffix.lower() not in ALLOWED_IMAGE_EXTS:
+            raise ValueError(f"Branch image {filename} has unsupported extension")
+    profile_labels = brand_profile.get("branch_labels") if brand_profile else None
+    branch_labels = _branch_labels(request.form.get("branch_labels"), branch_files, default_labels=profile_labels)
 
     job_id = uuid.uuid4().hex[:8]
     upload_dir = UPLOAD_DIR / job_id
@@ -333,9 +360,13 @@ def _create_job_from_request() -> dict[str, Any]:
         video_file.save(str(upload_dir / video_name))
         branch_names: list[str] = []
         for index, branch in enumerate(branch_files, start=1):
-            suffix = Path(branch.filename).suffix.lower()
+            source_name = _source_filename(branch)
+            suffix = Path(source_name).suffix.lower()
             name = f"branch_{index}{suffix}"
-            branch.save(str(upload_dir / name))
+            if hasattr(branch, "save"):
+                branch.save(str(upload_dir / name))
+            else:
+                shutil.copyfile(branch, upload_dir / name)
             branch_names.append(name)
 
         source_video_path = upload_dir / video_name
@@ -430,7 +461,9 @@ def _create_job_from_request() -> dict[str, Any]:
         "manual_quad": manual_quad,
         "manual_scene_quads": manual_scene_quads,
         "asset_bindings": asset_bindings,
-        "target_hint": request.form.get("target_hint") or None,
+        "target_hint": request.form.get("target_hint") or (brand_profile.get("target_hint") if brand_profile else None),
+        "brand_profile_id": brand_profile_id,
+        "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
         "output_urls": [],
     })
     JOBS[job_id] = job
@@ -962,6 +995,12 @@ def _process_job(job_id: str) -> None:
         })
         surface_ids = [surface["surface_id"] for scene in (scene_plan or []) for surface in scene.get("surfaces", [])]
         requires_explicit_bindings = any(len(scene.get("surfaces", [])) > 1 for scene in (scene_plan or []))
+        profile_fit = job.get("brand_profile_default_fit")
+        if job.get("asset_bindings") is None and profile_fit in {"cover", "contain"} and surface_ids and not requires_explicit_bindings:
+            job["asset_bindings"] = [
+                {"branch_index": index, "surface_ids": surface_ids, "fit": profile_fit}
+                for index in range(1, len(sign_paths) + 1)
+            ]
         try:
             asset_bindings = _normalize_asset_bindings(
                 job.get("asset_bindings"),
@@ -1081,6 +1120,69 @@ def _recover_jobs_for_wsgi() -> None:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/brand-profiles", methods=["POST"])
+def create_brand_profile_endpoint():
+    """Persist reusable branch artwork without exposing filesystem paths."""
+    if len(list_profiles(PROFILE_DIR)) >= MAX_PROFILE_COUNT:
+        return jsonify({"error": f"brand profile limit reached ({MAX_PROFILE_COUNT})"}), 429
+    brand_name = (request.form.get("brand_name") or "").strip()
+    if not brand_name:
+        return jsonify({"error": "brand_name is required"}), 400
+    branch_files = _branch_files(request.files)
+    if not 1 <= len(branch_files) <= MAX_BRANCHES:
+        return jsonify({"error": f"1 to 10 branch image assets required, got {len(branch_files)}"}), 400
+    try:
+        labels = _branch_labels(request.form.get("branch_labels"), branch_files)
+        profile_id = (request.form.get("profile_id") or f"brand_{uuid.uuid4().hex[:10]}").strip()
+        default_fit = request.form.get("default_fit", "cover")
+        with tempfile.TemporaryDirectory(prefix="franchiseflow-profile-") as temporary:
+            sources: list[Path] = []
+            for index, branch in enumerate(branch_files, start=1):
+                filename = _source_filename(branch)
+                suffix = Path(filename).suffix.lower()
+                if suffix not in ALLOWED_IMAGE_EXTS:
+                    raise ValueError(f"Branch image {filename} has unsupported extension")
+                destination = Path(temporary) / f"branch_{index}{suffix}"
+                if hasattr(branch, "save"):
+                    branch.save(str(destination))
+                else:
+                    shutil.copyfile(branch, destination)
+                decoded = cv2.imread(str(destination), cv2.IMREAD_UNCHANGED)
+                if decoded is None or decoded.size == 0:
+                    raise ValueError(f"branch image {filename} could not be decoded")
+                if decoded.shape[0] * decoded.shape[1] > MAX_IMAGE_PIXELS:
+                    raise ValueError(f"branch image {filename} exceeds the {MAX_IMAGE_PIXELS} pixel limit")
+                sources.append(destination)
+            profile = create_profile(
+                PROFILE_DIR,
+                profile_id,
+                brand_name=brand_name,
+                target_hint=(request.form.get("target_hint") or None),
+                branch_labels=labels,
+                branch_sources=sources,
+                default_fit=default_fit,
+            )
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(profile), 201
+
+
+@app.route("/api/brand-profiles", methods=["GET"])
+def list_brand_profiles_endpoint():
+    return jsonify({"profiles": list_profiles(PROFILE_DIR)})
+
+
+@app.route("/api/brand-profiles/<profile_id>", methods=["GET"])
+def get_brand_profile_endpoint(profile_id: str):
+    try:
+        profile = load_profile(PROFILE_DIR, profile_id)
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if profile is None:
+        return jsonify({"error": "Brand profile not found"}), 404
+    return jsonify(profile)
 
 
 @app.route("/api/jobs", methods=["POST"])
