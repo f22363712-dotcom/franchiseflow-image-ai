@@ -21,12 +21,22 @@ document.addEventListener('DOMContentLoaded', () => {
   const metricReproj = document.getElementById('metric-reproj');
   const metricFailed = document.getElementById('metric-failed');
   const metricInitMode = document.getElementById('metric-init-mode');
+  const metricScenes = document.getElementById('metric-scenes');
+  const metricSurfaces = document.getElementById('metric-surfaces');
+  const sceneReviewControls = document.getElementById('scene-review-controls');
+  const scenePicker = document.getElementById('review-scene-picker');
+  const sceneReviewSummary = document.getElementById('scene-review-summary');
 
   let branchInputs = [];
   let activeJobId = null;
   let reviewQuad = null;
   let dragIndex = -1;
   let reviewBackground = null;
+  let reviewScenes = [];
+  let activeSceneId = null;
+  let reviewPreviewUrl = null;
+  const sceneQuads = new Map();
+  let previewRenderToken = 0;
 
   function addBranchInput() {
     if (branchInputs.length >= 10) return;
@@ -107,45 +117,186 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function drawVideoFirstFrame(file, quad = null) {
+  function drawVideoFirstFrame(file, quad = null, frameIndex = 0) {
+    const renderToken = ++previewRenderToken;
     const video = document.createElement('video');
     video.preload = 'metadata';
     video.muted = true;
     video.playsInline = true;
     video.src = URL.createObjectURL(file);
-    video.onloadeddata = () => { video.currentTime = 0; };
+    video.onloadeddata = () => {
+      const fps = Number(video.dataset.fps || 30);
+      video.currentTime = Math.max(0, Number(frameIndex) || 0) / fps;
+    };
     video.onseeked = () => {
+      if (renderToken !== previewRenderToken) return;
       placeholderPreview.style.display = 'none';
       previewCanvas.style.display = 'block';
       previewCanvas.width = video.videoWidth || 640;
       previewCanvas.height = video.videoHeight || 360;
+      const resolvedQuad = quad || (!reviewPanel.hidden ? centeredQuad() : null);
+      if (!quad && resolvedQuad && !reviewPanel.hidden) {
+        reviewQuad = cloneQuad(resolvedQuad);
+        if (activeSceneId != null) sceneQuads.set(String(activeSceneId), cloneQuad(resolvedQuad));
+      }
       const ctx = previewCanvas.getContext('2d');
       ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
       reviewBackground = document.createElement('canvas');
       reviewBackground.width = previewCanvas.width;
       reviewBackground.height = previewCanvas.height;
       reviewBackground.getContext('2d').drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-      drawQuadOverlay(ctx, quad, Boolean(reviewPanel && !reviewPanel.hidden));
+      drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
       URL.revokeObjectURL(video.src);
     };
   }
 
   function drawSampleFrame(url, quad) {
+    const renderToken = ++previewRenderToken;
     const image = new Image();
     image.onload = () => {
+      if (renderToken !== previewRenderToken) return;
       placeholderPreview.style.display = 'none';
       previewCanvas.style.display = 'block';
       previewCanvas.width = image.width;
       previewCanvas.height = image.height;
+      const resolvedQuad = quad || (!reviewPanel.hidden ? centeredQuad() : null);
+      if (!quad && resolvedQuad && !reviewPanel.hidden) {
+        reviewQuad = cloneQuad(resolvedQuad);
+        if (activeSceneId != null) sceneQuads.set(String(activeSceneId), cloneQuad(resolvedQuad));
+      }
       const ctx = previewCanvas.getContext('2d');
       ctx.drawImage(image, 0, 0);
       reviewBackground = document.createElement('canvas');
       reviewBackground.width = image.width;
       reviewBackground.height = image.height;
       reviewBackground.getContext('2d').drawImage(image, 0, 0);
-      drawQuadOverlay(ctx, quad, Boolean(reviewPanel && !reviewPanel.hidden));
+      drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
     };
     image.src = url;
+  }
+
+  function cloneQuad(quad) {
+    return Array.isArray(quad) && quad.length === 4
+      ? quad.map(point => [Number(point[0]), Number(point[1])])
+      : null;
+  }
+
+  function candidateQuad(scene) {
+    const surface = scene && Array.isArray(scene.surfaces) ? scene.surfaces[0] : null;
+    const candidates = [
+      surface && (surface.quad || surface.pixel_quad),
+      scene && scene.candidate && scene.candidate.quad,
+      scene && scene.vision_candidate && scene.vision_candidate.quad,
+      scene && scene.quad,
+    ];
+    for (const candidate of candidates) {
+      const quad = cloneQuad(candidate);
+      if (quad && quad.every(point => point.every(Number.isFinite))) return quad;
+    }
+    return null;
+  }
+
+  function centeredQuad() {
+    const width = previewCanvas.width || 640;
+    const height = previewCanvas.height || 360;
+    return [
+      [width * 0.20, height * 0.35],
+      [width * 0.80, height * 0.35],
+      [width * 0.80, height * 0.65],
+      [width * 0.20, height * 0.65],
+    ];
+  }
+
+  function sceneKey(scene) {
+    return String(scene && scene.scene_id != null ? scene.scene_id : 'scene_001');
+  }
+
+  function sceneInitMode(scene) {
+    const surface = scene && Array.isArray(scene.surfaces) ? scene.surfaces[0] : null;
+    return (scene && scene.initialization_mode) || (surface && surface.initialization_mode) || '待确认';
+  }
+
+  function sceneRange(scene) {
+    const start = scene && scene.start_frame != null ? scene.start_frame : '?';
+    const end = scene && scene.end_frame != null ? scene.end_frame : '?';
+    return `帧 ${start} 至 ${end}`;
+  }
+
+  function sceneStatus(scene) {
+    const status = scene && scene.status ? String(scene.status) : 'needs_review';
+    return ({ok: '已通过', accepted: '已通过', validated: '已通过', reviewed: '已复核', needs_review: '需确认', failed: '跟踪失败', queued: '待处理'})[status] || status;
+  }
+
+  function scenePreview(scene) {
+    if (!scene) return null;
+    return scene.preview || scene.sample_preview || scene.preview_url || null;
+  }
+
+  function updateSceneReviewMeta(scene) {
+    if (!sceneReviewSummary) return;
+    if (!scene) {
+      sceneReviewSummary.textContent = '';
+      return;
+    }
+    const surface = Array.isArray(scene.surfaces) ? scene.surfaces[0] : null;
+    const surfaceStatus = surface && surface.status ? ` · 平面 ${sceneStatus(surface)}` : '';
+    sceneReviewSummary.textContent = `${sceneRange(scene)} · 初始化 ${sceneInitMode(scene)} · ${sceneStatus(scene)}${surfaceStatus}`;
+    const reasons = (scene.validation && scene.validation.reasons) || (scene.candidate && scene.candidate.validation && scene.candidate.validation.reasons);
+    reviewReasons.textContent = (reasons && reasons.length) ? reasons.join('、') : (sceneStatus(scene) === '需确认' ? '该场景的候选需要人工确认。' : '请检查招牌四角后提交。');
+  }
+
+  function drawReviewScene(scene) {
+    const quad = activeSceneId == null ? reviewQuad : sceneQuads.get(String(activeSceneId));
+    const preview = scenePreview(scene) || reviewPreviewUrl;
+    if (preview) drawSampleFrame(preview, quad);
+    else if (videoInput.files[0]) drawVideoFirstFrame(videoInput.files[0], quad, scene && scene.start_frame);
+    else {
+      previewRenderToken += 1;
+      reviewBackground = null;
+      redrawReview();
+    }
+    updateSceneReviewMeta(scene);
+  }
+
+  function saveActiveSceneQuad() {
+    if (activeSceneId != null && reviewQuad) sceneQuads.set(String(activeSceneId), cloneQuad(reviewQuad));
+  }
+
+  function switchReviewScene(sceneId) {
+    saveActiveSceneQuad();
+    const scene = reviewScenes.find(item => sceneKey(item) === String(sceneId));
+    if (!scene) return;
+    activeSceneId = sceneKey(scene);
+    reviewQuad = cloneQuad(sceneQuads.get(activeSceneId));
+    if (scenePicker && scenePicker.value !== activeSceneId) scenePicker.value = activeSceneId;
+    drawReviewScene(scene);
+  }
+
+  function setupSceneReview(job) {
+    reviewScenes = Array.isArray(job.scenes) ? job.scenes.slice(0, 2) : [];
+    sceneQuads.clear();
+    activeSceneId = null;
+    if (!reviewScenes.length) {
+      if (sceneReviewControls) sceneReviewControls.hidden = true;
+      return false;
+    }
+    reviewScenes.forEach(scene => {
+      const quad = candidateQuad(scene);
+      if (quad) sceneQuads.set(sceneKey(scene), quad);
+    });
+    if (sceneReviewControls) sceneReviewControls.hidden = false;
+    if (scenePicker) {
+      scenePicker.innerHTML = '';
+      reviewScenes.forEach(scene => {
+        const option = document.createElement('option');
+        option.value = sceneKey(scene);
+        option.textContent = `${sceneKey(scene)} · ${sceneRange(scene)} · ${sceneStatus(scene)}`;
+        scenePicker.appendChild(option);
+      });
+      scenePicker.onchange = () => switchReviewScene(scenePicker.value);
+    }
+    switchReviewScene(sceneKey(reviewScenes[0]));
+    return true;
   }
 
   function redrawReview() {
@@ -156,13 +307,18 @@ document.addEventListener('DOMContentLoaded', () => {
     drawQuadOverlay(ctx, reviewQuad, true);
   }
 
-  function updateMetrics(summary, mode) {
+  function updateMetrics(summary, mode, job = null) {
     metricFrames.textContent = summary.frames ? `${summary.frames} 帧 (${summary.fps || 0} fps)` : '-';
     metricTime.textContent = summary.processing_seconds != null ? `${summary.processing_seconds}s` : '-';
     metricInliers.textContent = summary.median_inliers != null ? Math.round(summary.median_inliers) : '-';
     metricReproj.textContent = summary.reprojection_median_px != null ? `${summary.reprojection_median_px.toFixed(2)} px` : '-';
     metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧` : '-';
     metricInitMode.textContent = mode || summary.initialization_mode || '-';
+    if (metricScenes) metricScenes.textContent = summary.scene_count != null ? summary.scene_count : (job && Array.isArray(job.scenes) ? job.scenes.length : '-');
+    const inferredSurfaces = job && Array.isArray(job.scenes)
+      ? job.scenes.reduce((count, scene) => count + (Array.isArray(scene.surfaces) ? scene.surfaces.length : 0), 0)
+      : null;
+    if (metricSurfaces) metricSurfaces.textContent = summary.surface_count != null ? summary.surface_count : (inferredSurfaces || '-');
   }
 
   function renderOutputs(urls) {
@@ -184,11 +340,16 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function showReview(job) {
-    reviewQuad = job.candidate && job.candidate.quad ? job.candidate.quad.map(point => point.slice()) : null;
     reviewPanel.hidden = false;
+    reviewPreviewUrl = job.sample_preview || job.preview || null;
+    const multiScene = setupSceneReview(job);
+    if (multiScene) return;
+    if (sceneReviewControls) sceneReviewControls.hidden = true;
+    activeSceneId = null;
+    reviewQuad = cloneQuad(job.candidate && job.candidate.quad);
     reviewReasons.textContent = (job.validation && job.validation.reasons ? job.validation.reasons.join('、') : job.error || '候选没有通过三帧检查。');
     if (videoInput.files[0]) drawVideoFirstFrame(videoInput.files[0], reviewQuad);
-    else if (job.sample_preview) drawSampleFrame(job.sample_preview, reviewQuad);
+    else if (reviewPreviewUrl) drawSampleFrame(reviewPreviewUrl, reviewQuad);
   }
 
   previewCanvas.addEventListener('pointerdown', event => {
@@ -209,7 +370,7 @@ document.addEventListener('DOMContentLoaded', () => {
       Math.max(0, Math.min(previewCanvas.width - 1, (event.clientX - rect.left) * previewCanvas.width / rect.width)),
       Math.max(0, Math.min(previewCanvas.height - 1, (event.clientY - rect.top) * previewCanvas.height / rect.height)),
     ];
-    const ctx = previewCanvas.getContext('2d');
+    saveActiveSceneQuad();
     redrawReview();
   });
   previewCanvas.addEventListener('pointerup', () => { dragIndex = -1; });
@@ -232,7 +393,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (job.status === 'completed') {
       reviewPanel.hidden = true;
       setStatus('合成完成', 'badge badge-status');
-      updateMetrics(job.summary || {}, job.initialization_mode);
+      updateMetrics(job.summary || {}, job.initialization_mode, job);
       renderOutputs(job.outputs || []);
       return;
     }
@@ -279,9 +440,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   reviewButton.addEventListener('click', async () => {
     if (!activeJobId || !reviewQuad) return;
+    saveActiveSceneQuad();
+    const payload = reviewScenes.length > 1
+      ? { scenes: reviewScenes.map(scene => ({ scene_id: sceneKey(scene), quad: sceneQuads.get(sceneKey(scene)) || centeredQuad() })) }
+      : { quad: reviewQuad };
     reviewButton.disabled = true;
     try {
-      const response = await fetch(`/api/jobs/${activeJobId}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quad: reviewQuad }) });
+      const response = await fetch(`/api/jobs/${activeJobId}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const job = await response.json();
       if (!response.ok) throw new Error(job.error || '提交人工确认失败');
       reviewPanel.hidden = true;

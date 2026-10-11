@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate
+from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate, _public_summary
 from job_store import load_job, save_job
 
 
@@ -32,6 +32,20 @@ def _make_dummy_mp4():
     frame = np.full((240, 320, 3), 100, dtype=np.uint8)
     writer.write(frame)
     writer.write(frame)
+    writer.release()
+    data = tmp_path.read_bytes()
+    tmp_path.unlink(missing_ok=True)
+    return io.BytesIO(data)
+
+
+def _make_two_scene_mp4():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (320, 240))
+    first = np.full((240, 320, 3), (20, 50, 100), dtype=np.uint8)
+    second = np.full((240, 320, 3), (180, 220, 30), dtype=np.uint8)
+    for frame in (first, first, second, second):
+        writer.write(frame)
     writer.release()
     data = tmp_path.read_bytes()
     tmp_path.unlink(missing_ok=True)
@@ -132,6 +146,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
                 self.assertEqual(res.status_code, 200)
                 json_data = res.get_json()
                 self.assertEqual(json_data["status"], "completed")
+                self.assertEqual(json_data["summary"]["scene_count"], 1)
                 self.assertEqual(json_data["vision_quad"], mock_quad)
                 self.assertEqual(len(json_data["outputs"]), 3)
                 self.assertIn("vision_audit", json_data)
@@ -199,6 +214,46 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
 
+    def test_hard_cut_video_sends_stable_scene_plan_to_tracker(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [{"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9}],
+        }
+        summary = {"frames": 4, "fps": 10.0, "failed_frames": [], "output_videos": []}
+        with patch("app.VisionClient", return_value=mock_instance), \
+             patch("app.validate_candidate", return_value={"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}), \
+             patch("app.run_tracker", return_value=summary) as tracker:
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["summary"]["scene_count"], 2)
+        call = tracker.call_args.kwargs
+        self.assertEqual([item["scene_id"] for item in call["scene_plan"]], ["scene_001", "scene_002"])
+        self.assertEqual([item["start_frame"] for item in call["scene_plan"]], [0, 2])
+
+    def test_scene_review_state_is_persisted_before_worker_returns(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [{"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.2}],
+        }
+        rejected = {"accepted": False, "requires_human_review": True, "reasons": ["inconsistent_samples"], "sample_metrics": []}
+        with patch("app.VisionClient", return_value=mock_instance), patch("app.validate_candidate", return_value=rejected):
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 500)
+        job = next(iter(JOBS.values()))
+        self.assertEqual(job["status"], "needs_review")
+        self.assertEqual(load_job(OUTPUT_DIR, job["job_id"])["status"], "needs_review")
+
     def test_create_job_rejects_more_than_ten_branches(self):
         data = {"video": (_make_dummy_mp4(), "video.mp4")}
         for index in range(11):
@@ -224,6 +279,66 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(res.get_json()["initialization_mode"], "reviewed_candidate")
         submit.assert_called_once_with(job_id)
 
+    def test_review_queue_full_keeps_job_reviewable(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "needs_review", "candidate": {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]]}})
+        save_job(OUTPUT_DIR, job_id, job)
+        with patch("app._submit_job", side_effect=RuntimeError("active job queue is full")):
+            response = self.client.post(f"/api/jobs/{job_id}/review", json={"quad": [[20, 20], [100, 20], [100, 80], [20, 80]]})
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(load_job(OUTPUT_DIR, job_id)["status"], "needs_review")
+
+    def test_multi_scene_review_persists_scene_plan(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({
+            "status": "needs_review",
+            "scenes": [
+                {"scene_id": "scene_001", "start_frame": 0, "end_frame": 1, "status": "needs_review"},
+                {"scene_id": "scene_002", "start_frame": 2, "end_frame": 3, "status": "needs_review"},
+            ],
+        })
+        save_job(OUTPUT_DIR, job_id, job)
+        payload = {"scenes": [
+            {"scene_id": "scene_001", "quad": [[20, 20], [100, 20], [100, 80], [20, 80]]},
+            {"scene_id": "scene_002", "quad": [[30, 30], [110, 30], [110, 90], [30, 90]]},
+        ]}
+        with patch("app._submit_job") as submit:
+            response = self.client.post(f"/api/jobs/{job_id}/review", json=payload)
+        self.assertEqual(response.status_code, 202)
+        saved = load_job(OUTPUT_DIR, job_id)
+        self.assertEqual(saved["initialization_mode"], "reviewed_candidate")
+        self.assertEqual([item["scene_id"] for item in saved["scene_plan"]], ["scene_001", "scene_002"])
+        self.assertEqual(saved["scene_plan"][1]["surfaces"][0]["quad"][0], [30.0, 30.0])
+        submit.assert_called_once_with(job_id)
+
+    def test_empty_scene_review_payload_is_rejected(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "needs_review", "scenes": []})
+        save_job(OUTPUT_DIR, job_id, job)
+        response = self.client.post(f"/api/jobs/{job_id}/review", json={"scenes": []})
+        self.assertEqual(response.status_code, 400)
+
     def test_outputs_endpoint_returns_branch_urls(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),
@@ -238,6 +353,113 @@ class FranchiseFlowAppTests(unittest.TestCase):
         res = self.client.get(f"/api/jobs/{job_id}/outputs")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(len(res.get_json()["outputs"]), 2)
+
+    def test_rejects_path_like_job_ids_without_server_error(self):
+        for url in ("/api/jobs/%2e%2e", "/api/jobs/%2e%2e/outputs", "/outputs/%2e%2e/app.py"):
+            response = self.client.get(url)
+            self.assertIn(response.status_code, (404, 400), url)
+
+    def test_corrupt_persisted_job_is_treated_as_missing(self):
+        job_dir = OUTPUT_DIR / "corrupt_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "job.json").write_text("{broken", encoding="utf-8")
+        try:
+            response = self.client.get("/api/jobs/corrupt_job")
+            self.assertEqual(response.status_code, 404)
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+    def test_public_summary_redacts_local_paths(self):
+        summary = _public_summary({"video": r"C:\secret\input.mp4", "output_videos": [r"C:\secret\branch.mp4"]})
+        self.assertEqual(summary["video"], "input.mp4")
+        self.assertEqual(summary["output_videos"], ["branch.mp4"])
+
+    def test_rejects_manual_quad_outside_uploaded_video(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+            "use_manual_quad": "true",
+            "manual_quad": json.dumps([[-1, 20], [100, 20], [100, 80], [-1, 80]]),
+        }
+        response = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("manual quad", response.get_json()["error"].lower())
+
+    def test_rejects_unreadable_branch_image(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(io.BytesIO(b"not an image"), "b1.png")],
+        }
+        response = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("decode", response.get_json()["error"].lower())
+
+    def test_rejects_new_job_when_active_queue_is_full(self):
+        class PendingFuture:
+            def done(self):
+                return False
+
+        import app as app_module
+        app_module.FUTURES.clear()
+
+    def test_sync_compatibility_endpoint_cannot_bypass_active_queue_limit(self):
+        import app as app_module
+
+        class PendingFuture:
+            def done(self):
+                return False
+
+        app_module.FUTURES.clear()
+        app_module.FUTURES["existing"] = PendingFuture()
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch.object(app_module, "MAX_ACTIVE_JOBS", 1):
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("queue", response.get_json()["error"].lower())
+        app_module.FUTURES.clear()
+        app_module.FUTURES["existing"] = PendingFuture()
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch.object(app_module, "MAX_ACTIVE_JOBS", 1):
+            response = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("queue", response.get_json()["error"].lower())
+        app_module.FUTURES.clear()
+
+    def test_submit_job_removes_completed_future(self):
+        import app as app_module
+
+        class ImmediateFuture:
+            def done(self):
+                return True
+
+            def add_done_callback(self, callback):
+                callback(self)
+
+        class ImmediateExecutor:
+            def submit(self, function, job_id):
+                return ImmediateFuture()
+
+        app_module.FUTURES.clear()
+        with patch.object(app_module, "EXECUTOR", ImmediateExecutor()):
+            app_module._submit_job("completed-future")
+        self.assertNotIn("completed-future", app_module.FUTURES)
+
+    def test_wsgi_first_request_triggers_recovery_once(self):
+        import app as app_module
+
+        app_module._RECOVERY_STARTED = False
+        with patch.object(app_module, "_recover_jobs") as recover:
+            app_module.app.config["TESTING"] = False
+            self.client.get("/")
+            self.client.get("/")
+        recover.assert_called_once_with()
+        app_module.app.config["TESTING"] = True
 
 
 if __name__ == "__main__":

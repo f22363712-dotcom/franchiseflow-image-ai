@@ -150,6 +150,90 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertEqual(five["branch_count"], 5)
         self.assertEqual(len(five["output_videos"]), 5)
 
+    def test_run_tracker_supports_two_independent_surfaces(self):
+        video_path = self.temp_dir / "two_surfaces.mp4"
+        frame = _create_textured_image()
+        for y in range(80, 260, 20):
+            for x in range(360, 600, 20):
+                color = (int((x + y) % 220), 70 + (x % 150), 210)
+                cv2.rectangle(frame, (x, y), (x + 18, y + 18), color, -1)
+                cv2.putText(frame, f"{x},{y}", (x + 2, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 255), 1)
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (640, 480))
+        for _ in range(3):
+            writer.write(frame)
+        writer.release()
+        sign = self.temp_dir / "surface_sign.png"
+        sign_img = np.full((100, 200, 4), (255, 0, 0, 255), dtype=np.uint8)
+        cv2.putText(sign_img, "LOCAL", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255, 255), 2)
+        cv2.imwrite(str(sign), sign_img)
+        quad_a = np.float32([[100, 100], [300, 100], [300, 250], [100, 250]])
+        quad_b = np.float32([[360, 100], [600, 100], [600, 250], [360, 250]])
+
+        summary = run_tracker(video_path, quad_a, [sign], self.temp_dir / "two_surface_out", no_debug=True, surface_quads=[quad_a, quad_b])
+
+        self.assertEqual(summary["surface_count"], 2)
+        self.assertEqual(summary["branch_count"], 1)
+        records = [json.loads(line) for line in (self.temp_dir / "two_surface_out" / "tracking.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records[0]["surface_details"]), 2)
+        self.assertEqual(len(summary["output_videos"]), 1)
+
+    def test_run_tracker_supports_two_hard_cut_scenes_with_stable_ids(self):
+        """A scene reset must use that scene's source frame and keep the timeline."""
+        video_path = self.temp_dir / "two_scenes.mp4"
+        first = _create_textured_image()
+        second = np.full_like(first, 95)
+        # Give the second scene a separate, textured planar surface.
+        for y in range(110, 270, 20):
+            for x in range(350, 590, 20):
+                color = (int((x + y) % 220), 70 + (x % 150), 210)
+                cv2.rectangle(second, (x, y), (x + 18, y + 18), color, -1)
+                cv2.putText(second, f"{x},{y}", (x + 2, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 255), 1)
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (640, 480))
+        for _ in range(3):
+            writer.write(first)
+        for _ in range(3):
+            writer.write(second)
+        writer.release()
+
+        sign = self.temp_dir / "scene_sign.png"
+        sign_img = np.full((100, 200, 4), (255, 0, 0, 255), dtype=np.uint8)
+        cv2.imwrite(str(sign), sign_img)
+        quad_a = np.float32([[100, 100], [300, 100], [300, 250], [100, 250]])
+        quad_b = np.float32([[350, 110], [590, 110], [590, 270], [350, 270]])
+        scene_plan = [
+            {"scene_id": "scene_001", "start_frame": 0, "end_frame": 2,
+             "surfaces": [{"surface_id": "surface_001", "quad": quad_a.tolist(),
+                           "initialization_mode": "manual_fallback"}]},
+            {"scene_id": "scene_002", "start_frame": 3, "end_frame": 5,
+             "surfaces": [{"surface_id": "surface_002", "quad": quad_b.tolist(),
+                           "initialization_mode": "reviewed_candidate"}]},
+        ]
+
+        summary = run_tracker(
+            video_path, quad_a, [sign], self.temp_dir / "two_scene_out", no_debug=True,
+            scene_plan=scene_plan,
+        )
+
+        self.assertEqual(summary["frames"], 6)
+        self.assertEqual(summary["scene_count"], 2)
+        self.assertEqual([item["scene_id"] for item in summary["scenes"]], ["scene_001", "scene_002"])
+        records = [json.loads(line) for line in (self.temp_dir / "two_scene_out" / "tracking.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([records[i]["scene_id"] for i in (0, 2, 3, 5)], ["scene_001", "scene_001", "scene_002", "scene_002"])
+        self.assertEqual(records[0]["surface_details"][0]["surface_id"], "surface_001")
+        self.assertEqual(records[3]["surface_details"][0]["surface_id"], "surface_002")
+
+    def test_run_tracker_rejects_non_contiguous_scene_plan(self):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=4, blank_frame_idx=-1)
+        scene_plan = [
+            {"scene_id": "scene_001", "start_frame": 0, "end_frame": 1,
+             "surfaces": [{"surface_id": "surface_001", "quad": quad.tolist()}]},
+            # Frame 2 is intentionally missing from the plan.
+            {"scene_id": "scene_002", "start_frame": 3, "end_frame": 3,
+             "surfaces": [{"surface_id": "surface_002", "quad": quad.tolist()}]},
+        ]
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            run_tracker(video_path, quad, signs[:1], self.temp_dir / "invalid_scene_out", scene_plan=scene_plan)
+
     @patch("tracker.run_tracker", return_value={"branch_count": 1})
     def test_cli_accepts_one_sign_asset(self, run_mock):
         with patch("sys.argv", ["tracker.py", "--video", "video.mp4", "--quad-json", "quad.json", "--signs", "one.png", "--out-dir", "out"]):

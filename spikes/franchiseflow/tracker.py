@@ -211,6 +211,67 @@ def parse_quad(value: Any) -> np.ndarray:
     return quad
 
 
+_INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate"}
+
+
+def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
+    """Validate and normalize the stable scene/surface manifest.
+
+    The tracker deliberately accepts a small, explicit manifest instead of
+    guessing scene boundaries.  Frame ranges are inclusive and must cover a
+    contiguous timeline beginning at frame zero.
+    """
+    if scene_plan is None:
+        return None
+    if not isinstance(scene_plan, list) or not 1 <= len(scene_plan) <= 2:
+        raise ValueError("scene_plan must contain between 1 and 2 scenes")
+
+    normalized: list[dict] = []
+    previous_end = -1
+    seen_scene_ids: set[str] = set()
+    seen_surface_ids: set[str] = set()
+    for scene_index, scene in enumerate(scene_plan):
+        if not isinstance(scene, dict):
+            raise ValueError("scene_plan entries must be objects")
+        scene_id = scene.get("scene_id")
+        if not isinstance(scene_id, str) or not scene_id or len(scene_id) > 64 or scene_id in seen_scene_ids:
+            raise ValueError("scene_id must be a unique non-empty string")
+        seen_scene_ids.add(scene_id)
+        start = scene.get("start_frame")
+        end = scene.get("end_frame")
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("scene frame bounds must be integers")
+        if start != previous_end + 1 or end < start:
+            raise ValueError("scene frame ranges must be contiguous starting at frame 0")
+        surfaces = scene.get("surfaces")
+        if not isinstance(surfaces, list) or not 1 <= len(surfaces) <= 4:
+            raise ValueError("each scene must contain between 1 and 4 surfaces")
+        normalized_surfaces: list[dict] = []
+        for surface in surfaces:
+            if not isinstance(surface, dict):
+                raise ValueError("scene surfaces must be objects")
+            surface_id = surface.get("surface_id")
+            if not isinstance(surface_id, str) or not surface_id or len(surface_id) > 64 or surface_id in seen_surface_ids:
+                raise ValueError("surface_id must be a unique non-empty string")
+            seen_surface_ids.add(surface_id)
+            mode = surface.get("initialization_mode", scene.get("initialization_mode", "manual_fallback"))
+            if mode not in _INITIALIZATION_MODES:
+                raise ValueError(f"unsupported scene surface initialization mode: {mode}")
+            normalized_surfaces.append({
+                "surface_id": surface_id,
+                "quad": parse_quad(surface.get("quad", surface.get("corners"))),
+                "initialization_mode": mode,
+            })
+        normalized.append({
+            "scene_id": scene_id,
+            "start_frame": start,
+            "end_frame": end,
+            "surfaces": normalized_surfaces,
+        })
+        previous_end = end
+    return normalized
+
+
 def run_tracker(
     video: str | Path,
     quad: list | np.ndarray | str | Path,
@@ -226,6 +287,8 @@ def run_tracker(
     preserve_audio: bool = True,
     model_name: str | None = None,
     source_candidate: dict | None = None,
+    surface_quads: list[list] | None = None,
+    scene_plan: list[dict] | None = None,
 ) -> dict[str, Any]:
     video_path = Path(video)
     if not video_path.exists():
@@ -234,6 +297,7 @@ def run_tracker(
         raise ValueError(f"between 1 and 10 signs are required, got {len(signs)}")
     if initialization_mode not in {"vision_model", "manual_fallback", "reviewed_candidate"}:
         raise ValueError(f"unsupported initialization mode: {initialization_mode}")
+    normalized_scene_plan = _normalize_scene_plan(scene_plan)
     for sign_path in signs:
         if not Path(sign_path).exists():
             raise ValueError(f"sign does not exist: {sign_path}")
@@ -264,6 +328,12 @@ def run_tracker(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     quad_pts = parse_quad(quad)
+    if surface_quads is None:
+        surface_points = [quad_pts]
+    else:
+        if not 1 <= len(surface_quads) <= 4:
+            raise ValueError(f"between 1 and 4 surface quads are supported, got {len(surface_quads)}")
+        surface_points = [parse_quad(item) for item in surface_quads]
 
     cap = cv2.VideoCapture(str(video_path))
     ok, first = cap.read()
@@ -271,7 +341,27 @@ def run_tracker(
         cap.release()
         raise ValueError(f"cannot decode {video_path}")
 
-    tracker = PlanarTracker(first, quad_pts, min_inliers, ransac_px, ratio)
+    if normalized_scene_plan is None:
+        trackers = [PlanarTracker(first, surface, min_inliers, ransac_px, ratio) for surface in surface_points]
+        surface_count = len(trackers)
+    else:
+        # Scene-local trackers are initialized at each scene's own source
+        # frame.  No scene plan is allowed to borrow the first scene anchor.
+        trackers = []
+        surface_points = []
+        surface_count = 0
+    max_surface_count = max((len(scene["surfaces"]) for scene in (normalized_scene_plan or [])), default=surface_count)
+    scene_stats = [
+        {
+            "scene_id": scene["scene_id"],
+            "start_frame": scene["start_frame"],
+            "end_frame": scene["end_frame"],
+            "surface_ids": [surface["surface_id"] for surface in scene["surfaces"]],
+            "failed_frames": 0,
+            "surface_failures": {surface["surface_id"]: 0 for surface in scene["surfaces"]},
+        }
+        for scene in (normalized_scene_plan or [])
+    ]
     loaded_signs = [load_sign(Path(p)) for p in signs]
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     height, width = first.shape[:2]
@@ -293,32 +383,127 @@ def run_tracker(
 
     records, t0 = [], time.perf_counter()
     frame, index = first, 0
+    scene_index = 0
+    active_scene = None
+    active_scene_stats = None
     log_file = (out_dir / "tracking.jsonl").open("w", encoding="utf-8")
     try:
         while frame is not None:
-            if index == 0:
-                h = np.eye(3)
+            if normalized_scene_plan is not None:
+                if scene_index >= len(normalized_scene_plan):
+                    raise ValueError("scene_plan ended before the decoded video timeline")
+                scene_config = normalized_scene_plan[scene_index]
+                if index > scene_config["end_frame"]:
+                    scene_index += 1
+                    if scene_index >= len(normalized_scene_plan):
+                        raise ValueError("scene_plan ended before the decoded video timeline")
+                    scene_config = normalized_scene_plan[scene_index]
+                if index != scene_config["start_frame"] and index < scene_config["start_frame"]:
+                    raise ValueError("scene_plan frame ranges are not contiguous with decoded timeline")
+                if index == scene_config["start_frame"]:
+                    active_scene = scene_config
+                    active_scene_stats = scene_stats[scene_index]
+                    surface_points = [surface["quad"] for surface in active_scene["surfaces"]]
+                    surface_count = len(surface_points)
+                    trackers = []
+                    for surface in active_scene["surfaces"]:
+                        try:
+                            trackers.append(PlanarTracker(frame, surface["quad"], min_inliers, ransac_px, ratio))
+                        except (ValueError, cv2.error) as exc:
+                            # Keep a positional placeholder so a failed surface
+                            # cannot accidentally borrow another surface's H.
+                            trackers.append(None)
+                    max_surface_count = max(max_surface_count, surface_count)
+
+            surface_details = []
+            homographies = []
+            for surface_index, tracker in enumerate(trackers):
+                surface_quad = surface_points[surface_index]
+                surface_config = active_scene["surfaces"][surface_index] if active_scene is not None else None
+                surface_mode = surface_config["initialization_mode"] if surface_config else initialization_mode
+                scene_id = active_scene["scene_id"] if active_scene is not None else None
+                surface_id = surface_config["surface_id"] if surface_config else None
+                if tracker is None:
+                    h = None
+                    surface_detail = {
+                        "status": "failed",
+                        "method": "none",
+                        "reason": "surface_initialization_failed",
+                        "render_policy": "unmodified_original_frame",
+                        "initialization_mode": surface_mode,
+                    }
+                elif active_scene is not None and index == active_scene["start_frame"]:
+                    h = np.eye(3)
+                    surface_detail = {
+                        "status": "ok",
+                        "method": "manual_first_frame" if surface_mode == "manual_fallback" else "vision_first_frame",
+                        "quad": surface_quad.tolist(),
+                        "inliers": len(tracker.key0),
+                        "reprojection_median_px": 0.0,
+                        "reprojection_p95_px": 0.0,
+                    }
+                elif active_scene is None and index == 0:
+                    h = np.eye(3)
+                    surface_detail = {
+                        "status": "ok",
+                        "method": "manual_first_frame" if initialization_mode == "manual_fallback" else "vision_first_frame",
+                        "quad": surface_quad.tolist(),
+                        "inliers": len(tracker.key0),
+                        "reprojection_median_px": 0.0,
+                        "reprojection_p95_px": 0.0,
+                    }
+                else:
+                    h, surface_detail = tracker.track(frame)
+                surface_detail["surface_index"] = surface_index
+                if scene_id is not None:
+                    surface_detail.update({"scene_id": scene_id, "surface_id": surface_id, "initialization_mode": surface_mode})
+                surface_details.append(surface_detail)
+                homographies.append(h)
+
+            if normalized_scene_plan is not None:
+                valid_details = [item for item in surface_details if item.get("status") == "ok"]
                 detail = {
-                    "status": "ok",
-                    "method": "manual_first_frame" if initialization_mode == "manual_fallback" else "vision_first_frame",
-                    "quad": quad_pts.tolist(),
-                    "inliers": len(tracker.key0),
-                    "reprojection_median_px": 0.0,
-                    "reprojection_p95_px": 0.0,
+                    "status": "ok" if len(valid_details) == surface_count else "failed",
+                    "method": "scene_surface_tracking",
+                    "scene_id": active_scene["scene_id"],
+                    "surface_count": surface_count,
+                    "surface_details": surface_details,
+                    "inliers": int(np.median([item.get("inliers", 0) for item in valid_details])) if valid_details else 0,
+                    "reprojection_median_px": float(np.median([item["reprojection_median_px"] for item in valid_details if "reprojection_median_px" in item])) if any("reprojection_median_px" in item for item in valid_details) else 0.0,
                 }
+                if detail["status"] == "failed":
+                    active_scene_stats["failed_frames"] += 1
+                for item in surface_details:
+                    if item.get("status") != "ok":
+                        active_scene_stats["surface_failures"][item["surface_id"]] += 1
+            elif surface_count == 1:
+                detail = surface_details[0]
             else:
-                h, detail = tracker.track(frame)
+                valid_details = [item for item in surface_details if item.get("status") == "ok"]
+                detail = {
+                    "status": "ok" if len(valid_details) == surface_count else "failed",
+                    "method": "multi_surface",
+                    "surface_count": surface_count,
+                    "surface_details": surface_details,
+                    "inliers": int(np.median([item.get("inliers", 0) for item in valid_details])) if valid_details else 0,
+                    "reprojection_median_px": float(np.median([item["reprojection_median_px"] for item in valid_details if "reprojection_median_px" in item])) if any("reprojection_median_px" in item for item in valid_details) else 0.0,
+                }
             detail.update(frame=index, seconds=index / fps)
             records.append(detail)
             log_file.write(json.dumps(detail) + "\n")
-            current_quad = project_quad(h, quad_pts) if h is not None else None
+            current_quads = [project_quad(h, surface) if h is not None else None for h, surface in zip(homographies, surface_points)]
             for writer, sign in zip(writers, loaded_signs):
-                writer.write(composite(frame, sign, current_quad, illumination) if current_quad is not None else frame)
+                rendered = frame
+                for current_quad in current_quads:
+                    if current_quad is not None:
+                        rendered = composite(rendered, sign, current_quad, illumination)
+                writer.write(rendered)
             if debug is not None:
                 annotated = frame.copy()
-                if current_quad is not None:
-                    cv2.polylines(annotated, [np.round(current_quad).astype(np.int32)], True, (0, 255, 255), 2)
-                label = f"{index} {detail['status']} {detail['method']} inliers={detail.get('inliers', 0)} err={detail.get('reprojection_median_px', 0):.2f}px"
+                for current_quad in current_quads:
+                    if current_quad is not None:
+                        cv2.polylines(annotated, [np.round(current_quad).astype(np.int32)], True, (0, 255, 255), 2)
+                label = f"{index} {detail['status']} {detail['method']} surfaces={surface_count} inliers={detail.get('inliers', 0)} err={detail.get('reprojection_median_px', 0):.2f}px"
                 cv2.rectangle(annotated, (0, 0), (width, 38), (0, 0, 0), -1)
                 cv2.putText(
                     annotated,
@@ -344,6 +529,15 @@ def run_tracker(
         if debug is not None:
             debug.release()
 
+    if normalized_scene_plan is not None:
+        processed_last = index - 1
+        expected_last = normalized_scene_plan[-1]["end_frame"]
+        if expected_last != processed_last:
+            limit_note = " after max_frames truncation" if max_frames else ""
+            raise ValueError(
+                f"scene_plan must end at processed frame {processed_last}{limit_note}; got {expected_last}"
+            )
+
     # Transcode OpenCV mp4v outputs to web-compatible H.264 (yuv420p + faststart)
     audio_present = bool(preserve_audio and has_audio_stream(video_path))
     for raw_p, target_p in zip(raw_paths, target_paths):
@@ -362,6 +556,29 @@ def run_tracker(
 
     from metrics import compute_summary
 
+    scene_summary = [
+        {
+            "scene_id": item["scene_id"],
+            "start_frame": item["start_frame"],
+            "end_frame": item["end_frame"],
+            "surface_ids": item["surface_ids"],
+            "failed_frames": item["failed_frames"],
+            "surface_failures": [
+                {"surface_id": surface_id, "failed_frames": failed_frames}
+                for surface_id, failed_frames in item["surface_failures"].items()
+            ],
+        }
+        for item in scene_stats
+    ]
+    if normalized_scene_plan is None:
+        scene_summary = [{
+            "scene_id": "scene_001",
+            "start_frame": 0,
+            "end_frame": max(0, index - 1),
+            "surface_ids": [f"surface_{position:03d}" for position in range(1, surface_count + 1)],
+            "failed_frames": sum(1 for record in records if record.get("status") != "ok"),
+            "surface_failures": [],
+        }]
     summary = compute_summary(
         records=records,
         fps=fps,
@@ -375,10 +592,22 @@ def run_tracker(
             "opencv_version": cv2.__version__,
             "numpy_version": np.__version__,
             "branch_count": len(signs),
+            "surface_count": max_surface_count if normalized_scene_plan is not None else surface_count,
+            "surface_quads": (
+                [surface.round(3).tolist() for scene in normalized_scene_plan for surface in [entry["quad"] for entry in scene["surfaces"]]]
+                if normalized_scene_plan is not None else
+                [surface.round(3).tolist() for surface in surface_points]
+            ),
+            "surface_failures": [
+                {"frame": record["frame"], "surfaces": [item.get("surface_index") for item in record.get("surface_details", []) if item.get("status") != "ok"]}
+                for record in records if record.get("surface_details") and record.get("status") != "ok"
+            ],
             "model": model_name,
             "audio_policy": "preserve_input_audio" if preserve_audio else "disabled",
             "audio_present": audio_present,
             "source_candidate": source_candidate,
+            "scene_count": len(scene_summary),
+            "scenes": scene_summary,
         },
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -390,6 +619,7 @@ def main():
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--quad", type=Path, help="manual TL TR BR BL pixel coordinates")
     parser.add_argument("--quad-json", type=Path, help="JSON file containing quad corners")
+    parser.add_argument("--surface-quad-json", type=Path, nargs="+", help="optional additional surface quad JSON files (up to four total surfaces)")
     parser.add_argument("--signs", type=Path, nargs="+", required=True, metavar="PNG")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--max-frames", type=int, default=0)
@@ -407,6 +637,11 @@ def main():
         raise ValueError("either --quad or --quad-json must be provided")
 
     mode = args.initialization_mode or "manual_fallback"
+    surface_quads = None
+    if args.surface_quad_json:
+        surface_quads = [read_quad(path) for path in args.surface_quad_json]
+        if quad_arg and not any(np.array_equal(parse_quad(quad_arg), surface) for surface in surface_quads):
+            surface_quads.insert(0, parse_quad(quad_arg))
 
     summary = run_tracker(
         video=args.video,
@@ -421,6 +656,7 @@ def main():
         no_debug=args.no_debug,
         initialization_mode=mode,
         model_name=args.model_name,
+        surface_quads=surface_quads,
     )
     print(json.dumps(summary, indent=2))
 

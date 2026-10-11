@@ -31,7 +31,7 @@
   <main class="main-container">
     <section class="hero-section">
       <h2 class="hero-title">一条移动门店视频 · 自动化多分支变体成片</h2>
-      <p class="hero-desc">首帧视觉大模型定位招牌平面，本地高保真 SIFT/RANSAC 几何透视跟踪，并行渲染多分支品牌独立视频。</p>
+      <p class="hero-desc">视觉模型先给出招牌候选四角，本地 SIFT/RANSAC 跟踪后并行渲染分支视频。当前支持最多 2 个硬切场景，每个场景 1 个主招牌；候选不确定时需要人工校准。</p>
     </section>
 
     <!-- Upload & Config Grid -->
@@ -40,7 +40,7 @@
       <section class="card panel-input">
         <div class="card-header">
           <h3 class="card-title">1. 上传素材与配置</h3>
-          <span class="card-subtitle">单视频 + 1 到 10 个分支素材</span>
+          <span class="card-subtitle">单视频 + 1 到 10 个分支素材 · 最多 2 个硬切场景</span>
         </div>
 
         <form id="render-form" class="render-form" data-job-endpoint="/api/jobs" data-review-state="needs_review">
@@ -84,7 +84,7 @@
                 <span class="toggle-label">人工校准基线 (Manual Calibration)</span>
               </label>
             </div>
-            <p class="mode-tip" id="mode-tip">优先调用视觉模型尝试定位招牌；若透视倾角存在偏差可切至人工校准基线。</p>
+            <p class="mode-tip" id="mode-tip">优先调用视觉模型尝试定位招牌；若透视倾角存在偏差可切至人工校准基线。硬切场景会在需要时逐场景确认。</p>
           </div>
 
           <div class="form-actions">
@@ -127,7 +127,12 @@
             <div class="review-panel" id="review-panel" hidden>
               <strong>需要人工确认</strong>
               <p id="review-reasons">模型候选没有通过三帧几何检查。</p>
-              <p>拖动预览中的四个角点，再提交本次确认。</p>
+              <div id="scene-review-controls" hidden style="margin:0.75rem 0;padding:0.75rem;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:rgba(255,255,255,0.02);">
+                <label for="review-scene-picker" style="display:block;font-size:0.78rem;color:#94a3b8;margin-bottom:0.35rem;">正在校准的场景</label>
+                <select id="review-scene-picker" style="width:100%;padding:0.45rem 0.55rem;border-radius:7px;background:#111827;color:#f8fafc;border:1px solid rgba(255,255,255,0.14);"></select>
+                <p id="scene-review-summary" style="font-size:0.76rem;color:#94a3b8;margin-top:0.45rem;"></p>
+              </div>
+              <p>拖动预览中的四个角点，再提交当前任务。多场景任务会一次提交每个场景的校准结果。</p>
               <button type="button" id="review-quad" class="btn btn-primary">提交人工确认</button>
             </div>
             <div class="metric-item">
@@ -149,6 +154,14 @@
             <div class="metric-item">
               <span class="metric-label">初始化途径</span>
               <span class="metric-value" id="metric-init-mode">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">硬切场景数</span>
+              <span class="metric-value" id="metric-scenes">-</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">跟踪平面数</span>
+              <span class="metric-value" id="metric-surfaces">-</span>
             </div>
           </div>
         </div>
