@@ -96,7 +96,7 @@ def detect_scenes(
     histogram_threshold: float = 0.70,
     min_scene_frames: int = 2,
     soft_window: int = 3,
-    soft_difference_threshold: float = 0.25,
+    soft_difference_threshold: float = 0.18,
     soft_histogram_threshold: float = 0.25,
 ) -> list[SceneSegment]:
     """Split frames at hard cuts and conservative dissolve boundaries.

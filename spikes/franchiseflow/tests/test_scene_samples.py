@@ -63,6 +63,32 @@ class SceneSamplingTests(unittest.TestCase):
         self.assertEqual([index for index, _ in scenes[1]["samples"]], [2, 3])
         self.assertEqual([scene["cut_before"] for scene in scenes], [None, 2])
 
+    def test_encoded_dissolve_returns_new_scene_anchor(self):
+        rng = np.random.default_rng(9)
+        first = np.full((48, 80, 3), (40, 80, 140), dtype=np.uint8)
+        second = np.full((48, 80, 3), (180, 30, 20), dtype=np.uint8)
+        for y in range(0, 48, 8):
+            for x in range(0, 80, 8):
+                cv2.rectangle(first, (x, y), (x + 4, y + 4), tuple(int(value) for value in rng.integers(0, 255, 3)), -1)
+                cv2.rectangle(second, (x, y), (x + 4, y + 4), tuple(int(value) for value in rng.integers(0, 255, 3)), -1)
+        frames = []
+        for index in range(12):
+            if index <= 2:
+                frame = first
+            elif index >= 9:
+                frame = second
+            else:
+                frame = ((1 - (index - 3) / 6) * first + ((index - 3) / 6) * second).astype(np.uint8)
+            frames.append(frame)
+        path = self.temp_dir / "encoded_dissolve.mp4"
+        _write_video(path, frames)
+
+        scenes = sample_video_scenes(path)
+
+        self.assertEqual(len(scenes), 2)
+        self.assertEqual(scenes[1]["transition_type"], "dissolve")
+        self.assertEqual((scenes[0]["start_frame"], scenes[1]["end_frame"]), (0, 11))
+
     def test_three_hard_cut_scenes_are_preserved_with_eight_scene_budget(self):
         colours = [(20, 50, 100), (180, 220, 30), (30, 180, 220)]
         frames = [np.full((48, 80, 3), colour, dtype=np.uint8) for colour in colours for _ in range(2)]
