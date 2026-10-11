@@ -80,7 +80,7 @@
 当前同步接口改为本地可复现的轻量任务状态：
 
 - `POST /api/jobs` 创建任务并返回 `job_id`。
-- `GET /api/jobs/<job_id>` 返回 `queued`、`running`、`needs_review`、`completed` 或 `failed`。
+- `GET /api/jobs/<job_id>` 返回 `queued`、`running`、`needs_review`、`completed`、`failed` 或 `vision_failed`。
 - `POST /api/jobs/<job_id>/review` 提交用户确认后的四角。
 - `GET /api/jobs/<job_id>/outputs` 返回每个分店的 H.264 视频链接。
 - 旧的 `POST /api/render` 保留为兼容入口，内部转发到任务创建流程。
@@ -101,7 +101,7 @@
 
 ## 失败策略
 
-- API 401、403、超时、响应结构错误：任务进入 `failed`，返回可读错误，不创建伪造结果。
+- API 401、403、超时、响应结构错误：任务进入 `vision_failed`，返回可读错误，不创建伪造结果。
 - 候选四角不合法或三帧验证不一致：任务进入 `needs_review`。
 - 人工确认后仍无法建立稳定单应矩阵：任务进入 `failed`，保留原始帧记录。
 - 单帧跟踪失败：写入失败帧，输出原画帧，继续处理后续帧。

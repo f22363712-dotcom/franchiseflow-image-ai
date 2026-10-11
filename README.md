@@ -25,7 +25,7 @@ FranchiseFlow 面向连锁品牌的视频本地化制作。用户上传一条连
  [每个分支一条 H.264 MP4，输入有音频时保留音轨]
 ```
 
-视觉模型只负责提出候选平面。每帧跟踪由本地 OpenCV 完成，模型不会被逐帧调用。RANSAC 内点拟合失败的帧写入 `tracking.jsonl`，该帧输出原画。
+视觉模型只负责提出候选平面。每帧跟踪由本地 OpenCV 完成，模型不会被逐帧调用。RANSAC 内点拟合失败的帧写入 `tracking.jsonl`，该帧输出原画。模型网关错误或坐标响应不合法时，任务进入 `vision_failed`，不会伪造成片。
 
 ## Quickstart
 
@@ -36,7 +36,7 @@ python -m pip install -r requirements.txt
 python prototype/franchiseflow/app.py
 ```
 
-打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；候选需要人工确认时，提交四角到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口。
+打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；候选需要人工确认时，提交四角到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口。服务会拒绝超过 250 MiB 的上传或超过 15 秒的视频。
 
 ### API key
 
@@ -68,7 +68,7 @@ python spikes/franchiseflow/tracker.py \
   --out-dir spikes/franchiseflow/outputs_demo_h264
 ```
 
-`--quad-json` 明确表示人工基线。若要标记为模型或人工复核结果，可传 `--initialization-mode vision_model` 或 `--initialization-mode reviewed_candidate`，不能用参数名推断来源。
+`--quad-json` 明确表示人工基线。若要标记为模型或人工复核结果，可传 `--initialization-mode vision_model` 或 `--initialization-mode reviewed_candidate`，不能用参数名推断来源。每个任务目录还会写入不含密钥的 `manifest.json`，记录模型、样本哈希、候选来源和输出状态。
 
 ## 实测边界
 

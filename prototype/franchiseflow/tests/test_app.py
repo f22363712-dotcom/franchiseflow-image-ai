@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR
+from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate
 from job_store import load_job, save_job
 
 
@@ -105,7 +105,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertIn("error", json_data)
             self.assertIn("HTTP 403", json_data["error"])
             self.assertEqual(len(JOBS), 1)
-            self.assertEqual(next(iter(JOBS.values()))["status"], "failed")
+            self.assertEqual(next(iter(JOBS.values()))["status"], "vision_failed")
 
     def test_successful_render_with_mocked_pipeline(self):
         data = {
@@ -134,12 +134,47 @@ class FranchiseFlowAppTests(unittest.TestCase):
                 self.assertEqual(json_data["status"], "completed")
                 self.assertEqual(json_data["vision_quad"], mock_quad)
                 self.assertEqual(len(json_data["outputs"]), 3)
+                self.assertIn("vision_audit", json_data)
+                self.assertEqual(json_data["vision_audit"]["candidate_count"], 1)
+                self.assertTrue((OUTPUT_DIR / json_data["job_id"] / "manifest.json").exists())
                 job_id = json_data["job_id"]
 
                 # Check GET /api/jobs/<job_id>
                 get_res = self.client.get(f"/api/jobs/{job_id}")
                 self.assertEqual(get_res.status_code, 200)
                 self.assertEqual(get_res.get_json()["status"], "completed")
+
+    def test_rejects_video_over_duration_cap(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app.MAX_VIDEO_SECONDS", 0.01):
+            res = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("duration", res.get_json()["error"])
+
+    def test_rejects_upload_over_size_cap(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app.MAX_UPLOAD_BYTES", 1):
+            res = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("size", res.get_json()["error"])
+
+    def test_frontend_persists_job_and_review_preview(self):
+        app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("localStorage", app_js)
+        self.assertIn("sample_preview", app_js)
+        self.assertIn("redrawReview", app_js)
+
+    def test_normalises_contact_sheet_candidate_back_to_source_panel(self):
+        candidate = {"quad": [[660, 50], [740, 50], [740, 120], [660, 120]], "confidence": 0.9}
+        mapped = _normalise_candidate(candidate, scale=1.0, panel_width=640, panel_count=3)
+        self.assertEqual(mapped["source_panel_index"], 1)
+        self.assertEqual(mapped["quad"], [[20.0, 50.0], [100.0, 50.0], [100.0, 120.0], [20.0, 120.0]])
 
     def test_get_demo_results(self):
         res = self.client.get("/api/demo_results")

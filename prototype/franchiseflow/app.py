@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +36,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_VIDEO_EXTS = {".mp4"}
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 MAX_BRANCHES = 10
+MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+MAX_VIDEO_SECONDS = 15.0
 
 JOBS: dict[str, dict[str, Any]] = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="franchiseflow")
@@ -42,7 +47,42 @@ FUTURES: dict[str, Any] = {}
 def _set_job(job: dict[str, Any]) -> dict[str, Any]:
     JOBS[job["job_id"]] = job
     save_job(OUTPUT_DIR, job["job_id"], job)
+    _write_manifest(job)
     return job
+
+
+def _write_manifest(job: dict[str, Any]) -> None:
+    """Persist a small, secret-free audit record beside each job."""
+    job_dir = OUTPUT_DIR / job["job_id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    summary = job.get("summary") or {}
+    manifest = {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "phase": job.get("phase"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "video_file": job.get("video_file"),
+        "branch_files": job.get("branch_files", []),
+        "branch_count": job.get("branch_count"),
+        "initialization_mode": job.get("initialization_mode"),
+        "model": job.get("model"),
+        "target_hint": job.get("target_hint"),
+        "candidate": job.get("candidate"),
+        "reviewed_quad": job.get("reviewed_quad"),
+        "vision_audit": job.get("vision_audit"),
+        "sample_preview": job.get("sample_preview"),
+        "contact_sheet_preview": job.get("contact_sheet_preview"),
+        "outputs": job.get("outputs", []),
+        "summary": {
+            key: value for key, value in summary.items()
+            if key not in {"output_videos"}
+        },
+        "error": job.get("error"),
+    }
+    temp = job_dir / ".manifest.json.tmp"
+    temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, job_dir / "manifest.json")
 
 
 def _job(job_id: str) -> dict[str, Any] | None:
@@ -118,6 +158,27 @@ def _create_job_from_request() -> dict[str, Any]:
         branch.save(str(upload_dir / name))
         branch_names.append(name)
 
+    video_path = upload_dir / video_name
+    branch_paths = [upload_dir / name for name in branch_names]
+    total_bytes = video_path.stat().st_size + sum(path.stat().st_size for path in branch_paths)
+    if total_bytes > MAX_UPLOAD_BYTES:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise ValueError(f"upload size exceeds the {MAX_UPLOAD_BYTES} byte limit")
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    cap.release()
+    if fps <= 0 or frame_count <= 0:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise ValueError("unable to read uploaded video duration")
+    duration = frame_count / fps
+    if duration > MAX_VIDEO_SECONDS:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise ValueError(f"video duration {duration:.2f}s exceeds the {MAX_VIDEO_SECONDS:.2f}s limit")
+
     manual = request.form.get("use_manual_quad", "false").lower() in {"true", "1", "yes"}
     manual_quad = None
     if manual:
@@ -154,44 +215,74 @@ def _paths(job: dict[str, Any]) -> tuple[Path, list[Path], Path]:
     return upload_dir / job["video_file"], [upload_dir / name for name in job["branch_files"]], OUTPUT_DIR / job_id
 
 
-def _normalise_candidate(candidate: dict[str, Any], scale: float) -> dict[str, Any]:
-    return {
+def _normalise_candidate(candidate: dict[str, Any], scale: float, panel_width: int | None = None, panel_count: int | None = None) -> dict[str, Any]:
+    points = [[float(point[0]), float(point[1])] for point in candidate["quad"]]
+    panel_index = None
+    if panel_width and panel_count:
+        min_x = min(point[0] for point in points)
+        max_x = max(point[0] for point in points)
+        mean_x = sum(point[0] for point in points) / len(points)
+        panel_index = min(panel_count - 1, max(0, int(mean_x // panel_width)))
+        left = panel_index * panel_width
+        right = left + panel_width
+        if max_x - min_x > panel_width * 1.05 or min_x < left - 1 or max_x > right + 1:
+            raise ValueError("candidate crosses contact-sheet panel boundary")
+        points = [[point[0] - left, point[1]] for point in points]
+    result = {
         **candidate,
-        "quad": [[round(float(point[0]) / scale, 3), round(float(point[1]) / scale, 3)] for point in candidate["quad"]],
+        "quad": [[round(point[0] / scale, 3), round(point[1] / scale, 3)] for point in points],
     }
+    if panel_index is not None:
+        result["source_panel_index"] = panel_index
+    return result
 
 
-def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]], sample_dir: Path, target_hint: str | None) -> tuple[dict[str, Any] | None, dict[str, Any], str]:
+def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]], sample_dir: Path, target_hint: str | None) -> tuple[dict[str, Any] | None, dict[str, Any], str, dict[str, Any]]:
     contact_sheet, panel_width, panel_height, scale = _save_contact_sheet(samples, sample_dir)
     first_height, first_width = samples[0][1].shape[:2]
     client = VisionClient()
-    result = client.locate_candidates(contact_sheet, panel_width, panel_height, target_hint=target_hint)
+    panel_count = len(samples)
+    sheet_width = panel_width * panel_count
+    result = client.locate_candidates(contact_sheet, sheet_width, panel_height, target_hint=target_hint)
     # Keep old mocked clients and old gateways usable during migration.
     if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
         encoded_first = cv2.imencode(".jpg", samples[0][1])[1].tobytes()
         legacy = client.locate_sign(encoded_first, first_width, first_height, target_hint=target_hint)
         result = {"model": legacy.get("model", client.model), "candidates": [legacy]}
 
+    audit = {
+        "input_sha256": hashlib.sha256(contact_sheet).hexdigest(),
+        "candidate_count": len(result["candidates"]),
+        "model": str(result.get("model", client.model)),
+    }
+
     rejected: list[dict[str, Any]] = []
     for raw_candidate in result["candidates"]:
-        candidate = _normalise_candidate(raw_candidate, scale)
+        try:
+            candidate = _normalise_candidate(raw_candidate, scale, panel_width=panel_width, panel_count=panel_count)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"vision_failed: invalid contact-sheet candidate: {exc}") from exc
         validation = validate_candidate(samples, candidate)
         if validation["accepted"]:
-            return candidate, validation, str(result.get("model", client.model))
+            audit["accepted_candidate_confidence"] = candidate.get("confidence")
+            audit["validation_reasons"] = validation.get("reasons", [])
+            return candidate, validation, str(result.get("model", client.model)), audit
         rejected.append({"candidate": candidate, "validation": validation})
 
     if rejected:
         best = max(rejected, key=lambda item: float(item["candidate"].get("confidence", 0.0)))
-        raise CandidateReviewRequired(best["candidate"], best["validation"], str(result.get("model", client.model)))
+        audit["validation_reasons"] = best["validation"].get("reasons", [])
+        raise CandidateReviewRequired(best["candidate"], best["validation"], str(result.get("model", client.model)), audit)
     raise RuntimeError("vision_failed: the model returned no valid candidates")
 
 
 class CandidateReviewRequired(RuntimeError):
-    def __init__(self, candidate: dict[str, Any], validation: dict[str, Any], model: str):
+    def __init__(self, candidate: dict[str, Any], validation: dict[str, Any], model: str, audit: dict[str, Any]):
         super().__init__("candidate requires human review")
         self.candidate = candidate
         self.validation = validation
         self.model = model
+        self.audit = audit
 
 
 def _process_job(job_id: str) -> None:
@@ -207,18 +298,25 @@ def _process_job(job_id: str) -> None:
         sample_dir = output_dir / "samples"
         manual_quad = job.get("manual_quad")
         if manual_quad is not None:
+            _save_contact_sheet(samples, sample_dir)
             quad = parse_quad(manual_quad)
             mode = job.get("initialization_mode", "manual_fallback")
-            model_name = None
+            model_name = job.get("model")
             validation = None
-            candidate = None
+            candidate = job.get("candidate")
         else:
             job["phase"] = "vision_candidates"
             _set_job(job)
-            candidate, validation, model_name = _locate_and_validate(video_path, samples, sample_dir, job.get("target_hint"))
+            candidate, validation, model_name, vision_audit = _locate_and_validate(video_path, samples, sample_dir, job.get("target_hint"))
             quad = parse_quad(candidate["quad"])
             mode = "vision_model"
-            job.update({"candidate": candidate, "validation": validation, "model": model_name})
+            job.update({"candidate": candidate, "validation": validation, "model": model_name, "vision_audit": vision_audit})
+
+        job.update({
+            "sample_preview": f"/outputs/{job_id}/samples/first.jpg",
+            "contact_sheet_preview": f"/outputs/{job_id}/samples/contact_sheet.jpg",
+        })
+        _set_job(job)
 
         job["phase"] = "tracking"
         _set_job(job)
@@ -234,14 +332,29 @@ def _process_job(job_id: str) -> None:
         output_urls = [f"/outputs/{job_id}/{Path(path).name}" for path in summary.get("output_videos", [])]
         job.update({"status": "completed", "phase": "complete", "summary": summary, "outputs": output_urls, "output_urls": output_urls, "initialization_mode": mode})
     except CandidateReviewRequired as exc:
-        job.update({"status": "needs_review", "phase": "human_review", "candidate": exc.candidate, "validation": exc.validation, "model": exc.model, "error": "candidate requires human review"})
+        job.update({"status": "needs_review", "phase": "human_review", "candidate": exc.candidate, "validation": exc.validation, "model": exc.model, "vision_audit": exc.audit, "error": "candidate requires human review", "sample_preview": f"/outputs/{job_id}/samples/first.jpg", "contact_sheet_preview": f"/outputs/{job_id}/samples/contact_sheet.jpg"})
     except Exception as exc:
-        job.update({"status": "failed", "phase": "failed", "error": str(exc)})
+        message = str(exc)
+        vision_error = message.startswith("vision_failed") or "vision gateway" in message.lower() or "candidate response" in message.lower()
+        job.update({"status": "vision_failed" if vision_error else "failed", "phase": "vision_failed" if vision_error else "failed", "error": message})
     _set_job(job)
 
 
 def _submit_job(job_id: str) -> None:
     FUTURES[job_id] = EXECUTOR.submit(_process_job, job_id)
+
+
+def _recover_jobs() -> None:
+    """Resume queued/running jobs after a local process restart."""
+    for state_path in OUTPUT_DIR.glob("*/job.json"):
+        job = load_job(OUTPUT_DIR, state_path.parent.name)
+        if not job or job.get("status") not in {"queued", "running"}:
+            continue
+        if job.get("status") == "running":
+            job["status"] = "queued"
+            job["phase"] = "recovered_after_restart"
+            _set_job(job)
+        _submit_job(job["job_id"])
 
 
 @app.route("/")
@@ -316,6 +429,10 @@ def render_job():
         "vision_quad": job.get("candidate", {}).get("quad") if job.get("candidate") else job.get("manual_quad"),
         "initialization_mode": job.get("initialization_mode"),
         "summary": job.get("summary", {}),
+        "vision_audit": job.get("vision_audit"),
+        "sample_preview": job.get("sample_preview"),
+        "contact_sheet_preview": job.get("contact_sheet_preview"),
+        "manifest_url": f"/outputs/{job['job_id']}/manifest.json",
         "outputs": job.get("outputs", []),
     })
 
@@ -346,7 +463,7 @@ def get_demo_results():
     return jsonify(job_data)
 
 
-@app.route("/outputs/<job_id>/<filename>")
+@app.route("/outputs/<job_id>/<path:filename>")
 def serve_job_output(job_id: str, filename: str):
     job_dir = OUTPUT_DIR / job_id
     if not job_dir.exists():
@@ -355,4 +472,5 @@ def serve_job_output(job_id: str, filename: str):
 
 
 if __name__ == "__main__":
+    _recover_jobs()
     app.run(host="127.0.0.1", port=5000, debug=False)

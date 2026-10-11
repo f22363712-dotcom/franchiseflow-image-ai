@@ -115,7 +115,7 @@ class VisionClient:
         prompt += (
             "Return only JSON with key candidates. candidates must be an array of objects with quad, confidence, and reason. "
             "quad must be four image pixel corners in clockwise order [top-left, top-right, bottom-right, bottom-left]. "
-            "Use pixel coordinates for the supplied image size. If no clear planar sign exists, return an empty candidates array. "
+            "Use pixel coordinates for the full supplied image size (the input may contain three side-by-side video frames; do not reset x to a panel-local origin). If no clear planar sign exists, return an empty candidates array. "
             "Bound each physical signboard polygon strictly; do not include brick walls, windows, doors, or street."
         )
         payload = {
@@ -189,6 +189,10 @@ class VisionClient:
                 "reason": str(raw_candidate.get("reason", "")),
             })
 
+        if invalid_reasons:
+            # A mixed valid/invalid response is ambiguous: silently dropping a
+            # candidate can make the UI replace the wrong physical surface.
+            raise RuntimeError("vision_failed: invalid candidate response: " + ", ".join(invalid_reasons))
         if not candidates:
             reason = answer.get("reason") or ", ".join(invalid_reasons) or "no candidates"
             raise RuntimeError(f"vision model could not find a replaceable planar sign: {reason}")

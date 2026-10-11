@@ -115,7 +115,7 @@
 
 **Interfaces:**
 - `POST /api/jobs` accepts one MP4 and 1 to 10 `branches` files plus optional `target_hint`, `use_manual_quad`, and `manual_quad`; returns HTTP 202 with `job_id` and `status="queued"`.
-- `GET /api/jobs/<job_id>` returns `queued`, `running`, `needs_review`, `completed`, or `failed`, with phase, error, candidate preview metadata, and outputs when available.
+- `GET /api/jobs/<job_id>` returns `queued`, `running`, `needs_review`, `completed`, `failed`, or `vision_failed`, with phase, error, candidate preview metadata, and outputs when available.
 - `POST /api/jobs/<job_id>/review` accepts `{"quad": [[x,y], ...]}` and resumes a `needs_review` task with `initialization_mode="reviewed_candidate"`.
 - `GET /api/jobs/<job_id>/outputs` returns the completed branch URLs and summary.
 - `POST /api/render` remains a synchronous compatibility wrapper that creates a job and waits for its terminal state.
@@ -154,7 +154,7 @@
 
 **Interfaces:**
 - The form can add or remove branch image inputs up to ten and sends them as repeated `branches` fields.
-- The client polls `GET /api/jobs/<job_id>` every 750 ms until `completed`, `needs_review`, or `failed`.
+- The client polls `GET /api/jobs/<job_id>` every 750 ms until `completed`, `needs_review`, `failed`, or `vision_failed`.
 - A `needs_review` result displays the candidate preview and draggable four corners, then posts the corrected quad to `/api/jobs/<job_id>/review`.
 - The output grid is generated from the returned branch list, rather than assuming exactly three players.
 

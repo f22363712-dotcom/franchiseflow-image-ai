@@ -245,6 +245,8 @@ def run_tracker(
     def has_audio_stream(path: Path) -> bool:
         ffprobe = shutil.which("ffprobe")
         if not ffprobe:
+            if preserve_audio:
+                raise RuntimeError("FFprobe is required to preserve input audio but was not found in PATH.")
             return False
         probe = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
@@ -252,7 +254,11 @@ def run_tracker(
             stderr=subprocess.PIPE,
             text=True,
         )
-        return probe.returncode == 0 and bool(probe.stdout.strip())
+        if probe.returncode != 0:
+            if preserve_audio:
+                raise RuntimeError(f"FFprobe failed while checking input audio: {probe.stderr.strip()}")
+            return False
+        return bool(probe.stdout.strip())
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

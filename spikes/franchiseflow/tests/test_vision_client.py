@@ -87,6 +87,23 @@ class VisionClientParsingTests(unittest.TestCase):
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(result["candidates"][0]["quad"][2], [900.0, 250.0])
 
+    def test_rejects_response_with_any_mixed_coordinate_candidate(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [
+                {"quad": [[0.1, 0.1], [900, 0.1], [900, 250], [0.1, 250]], "confidence": 0.9, "reason": "mixed"},
+                {"quad": [[100, 100], [900, 100], [900, 250], [100, 250]], "confidence": 0.8, "reason": "valid"},
+            ]
+        })}}]}
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, _limit): return json.dumps(payload).encode()
+
+        with patch("vision_client.urllib.request.urlopen", return_value=FakeResponse()):
+            with self.assertRaises(RuntimeError):
+                VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(b"jpeg", 1000, 500)
+
 
     def test_raises_on_http_403_without_leaking_body(self):
         secret_body = b'{"error": {"message": "upstream_secret_token_12345"}}'

@@ -35,6 +35,14 @@ class JobStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_job(self.root, "../outside")
 
+    def test_rejects_illegal_completed_to_queued_transition(self):
+        job = create_job(self.root, "abc123", {})
+        job["status"] = "completed"
+        save_job(self.root, "abc123", job)
+        job["status"] = "queued"
+        with self.assertRaises(ValueError):
+            save_job(self.root, "abc123", job)
+
 
 if __name__ == "__main__":
     unittest.main()

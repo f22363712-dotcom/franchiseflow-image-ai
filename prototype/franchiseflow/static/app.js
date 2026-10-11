@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let activeJobId = null;
   let reviewQuad = null;
   let dragIndex = -1;
+  let reviewBackground = null;
 
   function addBranchInput() {
     if (branchInputs.length >= 10) return;
@@ -120,6 +121,10 @@ document.addEventListener('DOMContentLoaded', () => {
       previewCanvas.height = video.videoHeight || 360;
       const ctx = previewCanvas.getContext('2d');
       ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
+      reviewBackground = document.createElement('canvas');
+      reviewBackground.width = previewCanvas.width;
+      reviewBackground.height = previewCanvas.height;
+      reviewBackground.getContext('2d').drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
       drawQuadOverlay(ctx, quad, Boolean(reviewPanel && !reviewPanel.hidden));
       URL.revokeObjectURL(video.src);
     };
@@ -134,9 +139,21 @@ document.addEventListener('DOMContentLoaded', () => {
       previewCanvas.height = image.height;
       const ctx = previewCanvas.getContext('2d');
       ctx.drawImage(image, 0, 0);
-      drawQuadOverlay(ctx, quad, false);
+      reviewBackground = document.createElement('canvas');
+      reviewBackground.width = image.width;
+      reviewBackground.height = image.height;
+      reviewBackground.getContext('2d').drawImage(image, 0, 0);
+      drawQuadOverlay(ctx, quad, Boolean(reviewPanel && !reviewPanel.hidden));
     };
     image.src = url;
+  }
+
+  function redrawReview() {
+    if (!reviewBackground) return;
+    const ctx = previewCanvas.getContext('2d');
+    ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+    ctx.drawImage(reviewBackground, 0, 0, previewCanvas.width, previewCanvas.height);
+    drawQuadOverlay(ctx, reviewQuad, true);
   }
 
   function updateMetrics(summary, mode) {
@@ -193,13 +210,13 @@ document.addEventListener('DOMContentLoaded', () => {
       Math.max(0, Math.min(previewCanvas.height - 1, (event.clientY - rect.top) * previewCanvas.height / rect.height)),
     ];
     const ctx = previewCanvas.getContext('2d');
-    ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-    drawQuadOverlay(ctx, reviewQuad, true);
+    redrawReview();
   });
   previewCanvas.addEventListener('pointerup', () => { dragIndex = -1; });
 
   async function pollJob(jobId) {
     activeJobId = jobId;
+    localStorage.setItem('franchiseflow_job_id', jobId);
     const response = await fetch(`/api/jobs/${jobId}`);
     const job = await response.json();
     if (!response.ok) throw new Error(job.error || '读取任务状态失败');
@@ -218,6 +235,10 @@ document.addEventListener('DOMContentLoaded', () => {
       updateMetrics(job.summary || {}, job.initialization_mode);
       renderOutputs(job.outputs || []);
       return;
+    }
+    if (job.status === 'vision_failed') {
+      setStatus('视觉定位失败', 'badge');
+      throw new Error(job.error || '视觉模型没有返回可用候选');
     }
     throw new Error(job.error || '任务失败');
   }
@@ -245,6 +266,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const response = await fetch('/api/jobs', { method: 'POST', body: formData });
       const job = await response.json();
       if (!response.ok) throw new Error(job.error || `请求失败 (HTTP ${response.status})`);
+      localStorage.setItem('franchiseflow_job_id', job.job_id);
       await pollJob(job.job_id);
     } catch (error) {
       showError(error);
@@ -285,4 +307,7 @@ document.addEventListener('DOMContentLoaded', () => {
       showError(error);
     }
   });
+
+  const savedJobId = localStorage.getItem('franchiseflow_job_id');
+  if (savedJobId) pollJob(savedJobId).catch(showError);
 });

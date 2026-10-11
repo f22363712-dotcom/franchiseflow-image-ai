@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Any
 
 
-STATES = {"queued", "running", "needs_review", "completed", "failed"}
+STATES = {"queued", "running", "needs_review", "completed", "failed", "vision_failed"}
+
+ALLOWED_TRANSITIONS = {
+    "queued": {"queued", "running", "needs_review", "completed", "failed"},
+    "running": {"running", "queued", "needs_review", "completed", "failed", "vision_failed"},
+    "needs_review": {"needs_review", "queued", "failed"},
+    "completed": {"completed"},
+    "failed": {"failed"},
+    "vision_failed": {"vision_failed"},
+}
 
 
 def _now() -> str:
@@ -17,7 +26,7 @@ def _now() -> str:
 
 
 def _job_path(root: Path, job_id: str) -> Path:
-    if not job_id or Path(job_id).name != job_id or any(ch in job_id for ch in "\\/"):
+    if not job_id or job_id in {".", ".."} or Path(job_id).name != job_id or any(ch in job_id for ch in "\\/"):
         raise ValueError("invalid job id")
     return root / job_id / "job.json"
 
@@ -27,6 +36,7 @@ def create_job(root: str | Path, job_id: str, payload: dict[str, Any]) -> dict[s
     status = job.get("status", "queued")
     if status not in STATES:
         raise ValueError(f"unsupported job state: {status}")
+    job["status"] = status
     job["job_id"] = job_id
     job.setdefault("created_at", _now())
     job["updated_at"] = _now()
@@ -52,6 +62,11 @@ def save_job(root: str | Path, job_id: str, job: dict[str, Any]) -> None:
     status = job.get("status")
     if status not in STATES:
         raise ValueError(f"unsupported job state: {status}")
+    if path.exists():
+        previous = load_job(root, job_id)
+        previous_status = previous.get("status") if previous else None
+        if previous_status and status not in ALLOWED_TRANSITIONS.get(previous_status, {previous_status}):
+            raise ValueError(f"illegal job state transition: {previous_status} -> {status}")
     path.parent.mkdir(parents=True, exist_ok=True)
     job["updated_at"] = _now()
     fd, temp_name = tempfile.mkstemp(prefix=".job-", suffix=".json", dir=path.parent)
