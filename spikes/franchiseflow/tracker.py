@@ -19,8 +19,8 @@ import numpy as np
 from PIL import Image
 
 
-def transcode_to_h264(input_path: Path, output_path: Path) -> Path:
-    """Transcode video to H.264 (yuv420p) with faststart for universal HTML5 browser playback."""
+def transcode_to_h264(input_path: Path, output_path: Path, audio_source: Path | None = None) -> Path:
+    """Transcode video to H.264 and optionally copy audio from the source video."""
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         raise RuntimeError("FFmpeg is required for browser-compatible H.264 video encoding but was not found in PATH.")
@@ -28,12 +28,23 @@ def transcode_to_h264(input_path: Path, output_path: Path) -> Path:
         ffmpeg_bin,
         "-y",
         "-i", str(input_path),
+    ]
+    if audio_source is not None:
+        cmd += ["-i", str(audio_source)]
+    cmd += [
+        "-map", "0:v:0",
+    ]
+    if audio_source is not None:
+        cmd += ["-map", "1:a?", "-c:a", "aac"]
+    else:
+        cmd += ["-an"]
+    cmd += [
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-preset", "fast",
         "-crf", "22",
-        "-an",
+        "-shortest",
         str(output_path),
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -212,12 +223,17 @@ def run_tracker(
     ratio: float = 0.75,
     no_debug: bool = False,
     initialization_mode: str = "manual_fallback",
+    preserve_audio: bool = True,
+    model_name: str | None = None,
+    source_candidate: dict | None = None,
 ) -> dict[str, Any]:
     video_path = Path(video)
     if not video_path.exists():
         raise ValueError(f"video does not exist: {video_path}")
-    if len(signs) != 3:
-        raise ValueError(f"exactly 3 signs are required, got {len(signs)}")
+    if not 1 <= len(signs) <= 10:
+        raise ValueError(f"between 1 and 10 signs are required, got {len(signs)}")
+    if initialization_mode not in {"vision_model", "manual_fallback", "reviewed_candidate"}:
+        raise ValueError(f"unsupported initialization mode: {initialization_mode}")
     for sign_path in signs:
         if not Path(sign_path).exists():
             raise ValueError(f"sign does not exist: {sign_path}")
@@ -225,6 +241,18 @@ def run_tracker(
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         raise RuntimeError("FFmpeg is required for browser-compatible H.264 video encoding but was not found in PATH.")
+
+    def has_audio_stream(path: Path) -> bool:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return False
+        probe = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return probe.returncode == 0 and bool(probe.stdout.strip())
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -311,8 +339,9 @@ def run_tracker(
             debug.release()
 
     # Transcode OpenCV mp4v outputs to web-compatible H.264 (yuv420p + faststart)
+    audio_present = bool(preserve_audio and has_audio_stream(video_path))
     for raw_p, target_p in zip(raw_paths, target_paths):
-        transcode_to_h264(raw_p, target_p)
+        transcode_to_h264(raw_p, target_p, audio_source=video_path if audio_present else None)
         try:
             raw_p.unlink(missing_ok=True)
         except Exception:
@@ -339,6 +368,11 @@ def run_tracker(
         extra={
             "opencv_version": cv2.__version__,
             "numpy_version": np.__version__,
+            "branch_count": len(signs),
+            "model": model_name,
+            "audio_policy": "preserve_input_audio" if preserve_audio else "disabled",
+            "audio_present": audio_present,
+            "source_candidate": source_candidate,
         },
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -358,13 +392,15 @@ def main():
     parser.add_argument("--ratio", type=float, default=0.75)
     parser.add_argument("--illumination", action="store_true", help="approximate low-frequency lighting, not occlusion handling")
     parser.add_argument("--no-debug", action="store_true")
+    parser.add_argument("--initialization-mode", choices=["vision_model", "manual_fallback", "reviewed_candidate"], default=None)
+    parser.add_argument("--model", dest="model_name", default=None)
     args = parser.parse_args()
 
     quad_arg = args.quad or args.quad_json
     if not quad_arg:
         raise ValueError("either --quad or --quad-json must be provided")
 
-    mode = "manual_fallback" if args.quad else "vision_quad"
+    mode = args.initialization_mode or "manual_fallback"
 
     summary = run_tracker(
         video=args.video,
@@ -378,6 +414,7 @@ def main():
         ratio=args.ratio,
         no_debug=args.no_debug,
         initialization_mode=mode,
+        model_name=args.model_name,
     )
     print(json.dumps(summary, indent=2))
 

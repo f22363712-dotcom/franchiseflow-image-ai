@@ -127,10 +127,28 @@ class TrackerSyntheticTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_tracker(self.temp_dir / "non_existent.mp4", [[0, 0], [10, 0], [10, 10], [0, 10]], [], self.temp_dir / "out")
 
-        # Wrong number of signs
+        # Zero and more than ten signs are invalid
         video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
         with self.assertRaises(ValueError):
-            run_tracker(video_path, quad, signs[:2], self.temp_dir / "out")
+            run_tracker(video_path, quad, [], self.temp_dir / "out")
+        with self.assertRaises(ValueError):
+            run_tracker(video_path, quad, signs * 4, self.temp_dir / "out")
+
+    def test_run_tracker_supports_one_and_five_branches_and_records_manual_mode(self):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
+        one = run_tracker(video_path, quad, signs[:1], self.temp_dir / "one", no_debug=True)
+        self.assertEqual(one["branch_count"], 1)
+        self.assertEqual(one["initialization_mode"], "manual_fallback")
+        self.assertEqual(len(one["output_videos"]), 1)
+
+        extra = []
+        for index in range(2):
+            path = self.temp_dir / f"extra_{index}.png"
+            cv2.imwrite(str(path), np.full((100, 200, 4), (50 + index, 90, 140, 255), dtype=np.uint8))
+            extra.append(path)
+        five = run_tracker(video_path, quad, signs + extra, self.temp_dir / "five", no_debug=True)
+        self.assertEqual(five["branch_count"], 5)
+        self.assertEqual(len(five["output_videos"]), 5)
 
 
     @patch("shutil.which", return_value=None)
