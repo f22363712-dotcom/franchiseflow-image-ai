@@ -30,6 +30,7 @@ from app import (
     _locate_scenes,
     _normalise_candidate,
     _public_summary,
+    _recover_idempotency_entries,
     _reconcile_orphaned_batch_jobs,
 )
 from job_store import create_job, load_job, save_job
@@ -403,6 +404,131 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(batch_response.status_code, 507)
             self.assertIn("idempotency state unavailable", batch_response.get_json()["error"])
             create_batch.assert_not_called()
+
+    def test_idempotency_pending_retry_reuses_job_after_commit_write_failure(self):
+        import app as app_module
+
+        key = f"pending-crash-{uuid.uuid4().hex}"
+
+        def build_data():
+            return {
+                "video": (_make_dummy_mp4(), "video.mp4"),
+                "branches": [(_make_dummy_image("pending"), "branch.png")],
+            }
+
+        with patch.object(app_module, "_submit_job") as submit:
+            with patch.object(app_module.IDEMPOTENCY_STORE, "commit", side_effect=RuntimeError("simulated stop")):
+                first = self.client.post(
+                    "/api/jobs",
+                    data=build_data(),
+                    headers={"Idempotency-Key": key},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(first.status_code, 507)
+            entry = app_module.IDEMPOTENCY_STORE.get("jobs", key)
+            self.assertEqual(entry["state"], "pending")
+            job_id = entry["resource_id"]
+            self.assertIsNotNone(load_job(OUTPUT_DIR, job_id))
+
+            submit.reset_mock()
+            replay = self.client.post(
+                "/api/jobs",
+                data=build_data(),
+                headers={"Idempotency-Key": key},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(replay.status_code, 202)
+        self.assertEqual(replay.get_json()["job_id"], job_id)
+        self.assertEqual(app_module.IDEMPOTENCY_STORE.get("jobs", key)["state"], "committed")
+        submit.assert_not_called()
+        shutil.rmtree(UPLOAD_DIR / job_id, ignore_errors=True)
+        shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
+
+    def test_idempotency_pending_retry_reuses_batch_after_commit_write_failure(self):
+        import app as app_module
+
+        profile_id = f"pending_batch_profile_{uuid.uuid4().hex[:8]}"
+        key = f"pending-batch-crash-{uuid.uuid4().hex}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Pending Batch Brand",
+            "branches": [(_make_dummy_image("pending-batch"), "branch.png")],
+        }
+
+        def build_data():
+            return {
+                "brand_profile_id": profile_id,
+                "videos": [(_make_dummy_mp4(), "one.mp4")],
+            }
+
+        try:
+            self.assertEqual(
+                self.client.post(
+                    "/api/brand-profiles",
+                    data=profile_data,
+                    content_type="multipart/form-data",
+                ).status_code,
+                201,
+            )
+            with patch.object(app_module, "_submit_job") as submit:
+                with patch.object(app_module.IDEMPOTENCY_STORE, "commit", side_effect=RuntimeError("simulated stop")):
+                    first = self.client.post(
+                        "/api/batches",
+                        data=build_data(),
+                        headers={"Idempotency-Key": key},
+                        content_type="multipart/form-data",
+                    )
+                self.assertEqual(first.status_code, 507)
+                entry = app_module.IDEMPOTENCY_STORE.get("batches", key)
+                self.assertEqual(entry["state"], "pending")
+                batch_id = entry["resource_id"]
+                batch = app_module.load_batch(BATCH_DIR, batch_id)
+                self.assertIsNotNone(batch)
+                self.assertEqual(len(batch["job_ids"]), 1)
+                child_id = batch["job_ids"][0]
+
+                submit.reset_mock()
+                replay = self.client.post(
+                    "/api/batches",
+                    data=build_data(),
+                    headers={"Idempotency-Key": key},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(replay.status_code, 202)
+            self.assertEqual(replay.get_json()["batch_id"], batch_id)
+            self.assertEqual(app_module.IDEMPOTENCY_STORE.get("batches", key)["state"], "committed")
+            submit.assert_not_called()
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / child_id, ignore_errors=True) if "child_id" in locals() else None
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True) if "batch_id" in locals() else None
+
+    def test_restart_releases_missing_pending_reservation_and_commits_existing_job(self):
+        import app as app_module
+
+        missing_key = f"pending-missing-{uuid.uuid4().hex}"
+        missing_id = f"pending_missing_{uuid.uuid4().hex[:8]}"
+        app_module.IDEMPOTENCY_STORE.reserve("jobs", missing_key, "missing-fp", resource_id=missing_id)
+        result = _recover_idempotency_entries()
+        self.assertGreaterEqual(result["released"], 1)
+        self.assertIsNone(app_module.IDEMPOTENCY_STORE.get("jobs", missing_key))
+
+        existing_key = f"pending-existing-{uuid.uuid4().hex}"
+        existing_id = f"pending_existing_{uuid.uuid4().hex[:8]}"
+        try:
+            create_job(OUTPUT_DIR, existing_id, {
+                "status": "queued",
+                "phase": "queued",
+                "video_file": "input.mp4",
+                "branch_files": ["branch_1.png"],
+                "branch_count": 1,
+            })
+            app_module.IDEMPOTENCY_STORE.reserve("jobs", existing_key, "existing-fp", resource_id=existing_id)
+            result = _recover_idempotency_entries()
+            self.assertGreaterEqual(result["repaired"], 1)
+            self.assertEqual(app_module.IDEMPOTENCY_STORE.get("jobs", existing_key)["state"], "committed")
+        finally:
+            shutil.rmtree(OUTPUT_DIR / existing_id, ignore_errors=True)
 
     def test_brand_profile_can_be_created_and_listed(self):
         profile_id = f"test_brand_{uuid.uuid4().hex[:8]}"

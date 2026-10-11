@@ -11,8 +11,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from idempotency_store import (
+    DEFAULT_PENDING_TTL_SECONDS,
     IdempotencyConflict,
     IdempotencyError,
+    IdempotencyReservationError,
     IdempotencyStore,
     normalize_key,
     request_fingerprint,
@@ -81,6 +83,40 @@ class IdempotencyStoreTests(unittest.TestCase):
             self.store.put("jobs", "request-1", "fp-1", "job123")
         self.assertEqual(calls["count"], 2)
         self.assertEqual(self.store.get("jobs", "request-1")["resource_id"], "job123")
+
+    def test_reserve_is_stable_until_commit_and_rejects_payload_change(self):
+        first = self.store.reserve("jobs", "request-1", "fp-1", resource_id="stable-job")
+        second = self.store.reserve("jobs", "request-1", "fp-1", resource_id="different-job")
+        self.assertEqual(first["resource_id"], "stable-job")
+        self.assertEqual(second["resource_id"], "stable-job")
+        self.assertEqual(second["state"], "pending")
+        with self.assertRaises(IdempotencyConflict):
+            self.store.reserve("jobs", "request-1", "fp-2", resource_id="other-job")
+        committed = self.store.commit("jobs", "request-1", "fp-1", "stable-job")
+        self.assertEqual(committed["state"], "committed")
+        self.assertEqual(self.store.get("jobs", "request-1")["resource_id"], "stable-job")
+
+    def test_release_only_removes_pending_reservation(self):
+        self.store.reserve("jobs", "request-1", "fp-1", resource_id="stable-job")
+        self.assertTrue(self.store.release("jobs", "request-1", "fp-1", "stable-job"))
+        self.assertIsNone(self.store.get("jobs", "request-1"))
+        self.store.reserve("jobs", "request-1", "fp-1", resource_id="stable-job")
+        self.store.commit("jobs", "request-1", "fp-1", "stable-job")
+        self.assertFalse(self.store.release("jobs", "request-1", "fp-1", "stable-job"))
+        self.assertEqual(self.store.get("jobs", "request-1")["state"], "committed")
+
+    def test_pending_entries_and_stale_detection(self):
+        entry = self.store.reserve("jobs", "request-1", "fp-1", resource_id="stable-job")
+        self.assertEqual(len(self.store.pending_entries()), 1)
+        self.assertFalse(IdempotencyStore.is_stale(entry, now=entry["created_at"] + 1))
+        self.assertTrue(IdempotencyStore.is_stale(
+            entry,
+            now=entry["created_at"] + DEFAULT_PENDING_TTL_SECONDS + 1,
+        ))
+
+    def test_commit_requires_existing_matching_reservation(self):
+        with self.assertRaises(IdempotencyReservationError):
+            self.store.commit("jobs", "request-1", "fp-1", "stable-job")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,14 @@ from job_store import create_job, load_job, save_job
 from batch_store import create_batch, load_batch, save_batch
 from batch_delivery import BatchPackageError, build_batch_package
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
-from idempotency_store import IdempotencyConflict, IdempotencyError, IdempotencyStore, normalize_key, request_fingerprint
+from idempotency_store import (
+    DEFAULT_PENDING_TTL_SECONDS,
+    IdempotencyConflict,
+    IdempotencyError,
+    IdempotencyStore,
+    normalize_key,
+    request_fingerprint,
+)
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from scene_reuse import transfer_candidate
@@ -54,6 +61,7 @@ BATCH_DIR.mkdir(parents=True, exist_ok=True)
 BATCH_PACKAGE_DIR = BATCH_DIR / "packages"
 BATCH_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
 IDEMPOTENCY_STORE = IdempotencyStore(OUTPUT_DIR / "idempotency.json")
+IDEMPOTENCY_PENDING_TTL_SECONDS = DEFAULT_PENDING_TTL_SECONDS
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -177,6 +185,26 @@ def _idempotency_identity(scope: str) -> tuple[str, str] | None:
     return key, request_fingerprint(request, scope)
 
 
+def _idempotency_resource(scope: str, resource_id: str) -> dict[str, Any] | None:
+    """Load the durable resource named by an idempotency reservation."""
+    if not resource_id:
+        return None
+    if scope == "jobs":
+        return _job(resource_id)
+    if scope == "batches":
+        try:
+            batch = load_batch(BATCH_DIR, resource_id)
+        except (ValueError, RuntimeError, OSError):
+            return None
+        return _batch_public(batch) if batch is not None else None
+    return None
+
+
+def _idempotency_pending_response(scope: str, resource_id: str) -> dict[str, Any]:
+    field = "job_id" if scope == "jobs" else "batch_id"
+    return {field: resource_id, "status": "processing", "state": "pending"}
+
+
 def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[str, Any] | None, int] | None:
     """Return a previously created resource, or raise on payload mismatch."""
     entry = IDEMPOTENCY_STORE.get(scope, key)
@@ -185,20 +213,44 @@ def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[st
     if entry.get("fingerprint") != fingerprint:
         raise IdempotencyConflict("Idempotency-Key was already used with a different request")
     resource_id = str(entry.get("resource_id") or "")
-    resource = _job(resource_id) if scope == "jobs" else None
-    if scope == "batches" and resource_id:
-        try:
-            batch = load_batch(BATCH_DIR, resource_id)
-        except (ValueError, RuntimeError, OSError):
-            batch = None
-        resource = _batch_public(batch) if batch is not None else None
+    if IdempotencyStore.is_pending(entry):
+        resource = _idempotency_resource(scope, resource_id)
+        if resource is not None:
+            # A crash can leave the durable resource present while the final
+            # committed-index write never happened. Finish that transition on
+            # the first retry instead of creating a second resource.
+            IDEMPOTENCY_STORE.commit(
+                scope,
+                key,
+                fingerprint,
+                resource_id,
+                status_code=int(entry.get("status_code", 202)),
+            )
+            return resource, int(entry.get("status_code", 202))
+        if IdempotencyStore.is_stale(
+            entry,
+            ttl_seconds=IDEMPOTENCY_PENDING_TTL_SECONDS,
+        ):
+            IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id)
+            return None
+        return _idempotency_pending_response(scope, resource_id), 202
+    resource = _idempotency_resource(scope, resource_id)
     if resource is None:
         raise IdempotencyError("Idempotency-Key points to a missing resource")
     return resource, int(entry.get("status_code", 202))
 
 
 def _idempotency_record(scope: str, key: str, fingerprint: str, resource_id: str, status_code: int) -> None:
-    IDEMPOTENCY_STORE.put(scope, key, fingerprint, resource_id, status_code=status_code)
+    IDEMPOTENCY_STORE.commit(scope, key, fingerprint, resource_id, status_code=status_code)
+
+
+def _idempotency_reserve(scope: str, key: str, fingerprint: str, resource_id: str) -> dict[str, Any]:
+    """Reserve the caller-selected ID after replay checks have completed."""
+    return IDEMPOTENCY_STORE.reserve(scope, key, fingerprint, resource_id=resource_id)
+
+
+def _idempotency_release(scope: str, key: str, fingerprint: str, resource_id: str) -> None:
+    IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id)
 
 
 def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
@@ -372,6 +424,7 @@ def _parse_manual_scene_quads(raw_value: str | None) -> list[list[list[float]]] 
 def _create_job_from_request(
     video_file_override: Any | None = None,
     batch_id_override: str | None = None,
+    job_id_override: str | None = None,
 ) -> dict[str, Any]:
     """Create one durable job from the current request.
 
@@ -409,7 +462,9 @@ def _create_job_from_request(
     profile_labels = brand_profile.get("branch_labels") if brand_profile else None
     branch_labels = _branch_labels(request.form.get("branch_labels"), branch_files, default_labels=profile_labels)
 
-    job_id = uuid.uuid4().hex[:8]
+    job_id = str(job_id_override or uuid.uuid4().hex[:8])
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("invalid reserved job ID")
     upload_dir = UPLOAD_DIR / job_id
     output_dir = OUTPUT_DIR / job_id
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -1279,11 +1334,54 @@ def _process_job(job_id: str) -> None:
 
 
 def _recover_jobs() -> None:
-    """Repair batch indexes, then resume queued/running jobs after a restart."""
+    """Repair durable indexes, then resume queued/running jobs after restart."""
     global _RECOVERY_STARTED
     _RECOVERY_STARTED = True
+    _recover_idempotency_entries()
     _reconcile_orphaned_batch_jobs()
     _schedule_queued_jobs()
+
+
+def _recover_idempotency_entries() -> dict[str, int]:
+    """Finish or expire pending reservations left by a stopped process.
+
+    A pending entry with an existing job/batch means creation reached durable
+    state but the commit write was interrupted.  A missing resource at startup
+    cannot still be owned by a live request, so that reservation is released
+    immediately for a fresh attempt.  During a live request the replay path
+    keeps a missing reservation for a short TTL.
+    """
+    repaired = 0
+    released = 0
+    errors = 0
+    try:
+        entries = IDEMPOTENCY_STORE.pending_entries()
+    except (OSError, RuntimeError, IdempotencyError):
+        return {"repaired": 0, "released": 0, "errors": 1}
+    for entry in entries:
+        scope = str(entry.get("scope") or "")
+        key = str(entry.get("key") or "")
+        fingerprint = str(entry.get("fingerprint") or "")
+        resource_id = str(entry.get("resource_id") or "")
+        if not scope or not key or not fingerprint or not resource_id:
+            errors += 1
+            continue
+        try:
+            if _idempotency_resource(scope, resource_id) is not None:
+                IDEMPOTENCY_STORE.commit(
+                    scope,
+                    key,
+                    fingerprint,
+                    resource_id,
+                    status_code=int(entry.get("status_code", 202)),
+                )
+                repaired += 1
+            else:
+                if IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id):
+                    released += 1
+        except (IdempotencyConflict, IdempotencyError, OSError, RuntimeError):
+            errors += 1
+    return {"repaired": repaired, "released": released, "errors": errors}
 
 
 def _reconcile_orphaned_batch_jobs() -> dict[str, Any]:
@@ -1526,7 +1624,7 @@ def get_brand_profile_endpoint(profile_id: str):
     return jsonify(profile)
 
 
-def _create_batch_endpoint_impl():
+def _create_batch_endpoint_impl(batch_id_override: str | None = None):
     """Submit several videos against one reusable brand profile.
 
     Every video remains an ordinary FranchiseFlow job, so review, retry and
@@ -1556,7 +1654,9 @@ def _create_batch_endpoint_impl():
             allowed = ", ".join(sorted(ALLOWED_VIDEO_EXTS))
             return jsonify({"error": f"Video {video.filename} must use a supported video extension: {allowed}"}), 400
 
-    batch_id = uuid.uuid4().hex[:12]
+    batch_id = str(batch_id_override or uuid.uuid4().hex[:12])
+    if not JOB_ID_RE.fullmatch(batch_id):
+        return jsonify({"error": "invalid reserved batch ID"}), 400
     try:
         batch = create_batch(BATCH_DIR, batch_id, {
             "status": "queued",
@@ -1633,12 +1733,31 @@ def create_batch_endpoint():
         if replay is not None:
             resource, status_code = replay
             return jsonify(resource), status_code
-        response = _create_batch_endpoint_impl()
+        reserved_batch_id = uuid.uuid4().hex[:12]
+        try:
+            _idempotency_reserve("batches", key, fingerprint, reserved_batch_id)
+        except IdempotencyConflict as exc:
+            return jsonify({"error": str(exc)}), 409
+        except (IdempotencyError, OSError, RuntimeError) as exc:
+            return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        response = _create_batch_endpoint_impl(batch_id_override=reserved_batch_id)
         payload = response[0].get_json(silent=True) if isinstance(response, tuple) else response.get_json(silent=True)
         status_code = response[1] if isinstance(response, tuple) else response.status_code
-        if status_code == 202 and isinstance(payload, dict) and payload.get("batch_id"):
+        if isinstance(payload, dict) and payload.get("batch_id") == reserved_batch_id:
+            batch_exists = _idempotency_resource("batches", reserved_batch_id) is not None
+        else:
+            batch_exists = False
+        if batch_exists:
             try:
                 _idempotency_record("batches", key, fingerprint, payload["batch_id"], status_code)
+            except (IdempotencyError, OSError, RuntimeError) as exc:
+                # Leave the pending reservation intact.  A client retry can
+                # observe the durable batch and finish commit without making
+                # another batch.
+                return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        else:
+            try:
+                _idempotency_release("batches", key, fingerprint, reserved_batch_id)
             except (IdempotencyError, OSError, RuntimeError) as exc:
                 return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
         return response
@@ -1715,12 +1834,12 @@ def list_batches_endpoint():
     return jsonify({"batches": batches[:limit]})
 
 
-def _create_job_endpoint_impl():
+def _create_job_endpoint_impl(job_id_override: str | None = None):
     if _active_slot_count() >= MAX_ACTIVE_JOBS:
         return jsonify({"error": f"active job queue is full ({MAX_ACTIVE_JOBS} jobs); try again later"}), 429
     job = None
     try:
-        job = _create_job_from_request()
+        job = _create_job_from_request(job_id_override=job_id_override)
         _submit_job(job["job_id"])
         return jsonify(job), 202
     except ValueError as exc:
@@ -1758,12 +1877,30 @@ def create_job_endpoint():
         if replay is not None:
             resource, status_code = replay
             return jsonify(resource), status_code
-        response = _create_job_endpoint_impl()
+        reserved_job_id = uuid.uuid4().hex[:8]
+        try:
+            _idempotency_reserve("jobs", key, fingerprint, reserved_job_id)
+        except IdempotencyConflict as exc:
+            return jsonify({"error": str(exc)}), 409
+        except (IdempotencyError, OSError, RuntimeError) as exc:
+            return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        response = _create_job_endpoint_impl(job_id_override=reserved_job_id)
         payload = response[0].get_json(silent=True) if isinstance(response, tuple) else response.get_json(silent=True)
         status_code = response[1] if isinstance(response, tuple) else response.status_code
-        if status_code == 202 and isinstance(payload, dict) and payload.get("job_id"):
+        if isinstance(payload, dict) and payload.get("job_id") == reserved_job_id:
+            job_exists = _idempotency_resource("jobs", reserved_job_id) is not None
+        else:
+            job_exists = False
+        if job_exists:
             try:
                 _idempotency_record("jobs", key, fingerprint, payload["job_id"], status_code)
+            except (IdempotencyError, OSError, RuntimeError) as exc:
+                # Keep pending until a retry sees the durable job and commits
+                # the index.  Releasing here would permit a duplicate job.
+                return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        else:
+            try:
+                _idempotency_release("jobs", key, fingerprint, reserved_job_id)
             except (IdempotencyError, OSError, RuntimeError) as exc:
                 return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
         return response

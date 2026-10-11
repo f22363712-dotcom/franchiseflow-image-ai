@@ -15,11 +15,13 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 
 MAX_KEY_LENGTH = 255
+DEFAULT_PENDING_TTL_SECONDS = 15 * 60
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _STORE_LOCK = threading.RLock()
 
@@ -30,6 +32,10 @@ class IdempotencyError(ValueError):
 
 class IdempotencyConflict(IdempotencyError):
     """The key has already been used with a different request payload."""
+
+
+class IdempotencyReservationError(IdempotencyError):
+    """A reservation cannot be changed without creating a duplicate resource."""
 
 
 def normalize_key(raw_key: str | None) -> str | None:
@@ -114,7 +120,13 @@ def _entry_key(scope: str, key: str) -> str:
 
 
 class IdempotencyStore:
-    """Atomic JSON mapping of ``(scope, key)`` to a durable resource ID."""
+    """Atomic JSON mapping of ``(scope, key)`` to a durable resource ID.
+
+    Entries have two states.  ``pending`` is written before the resource is
+    created; ``committed`` is written after its durable state exists.  The
+    legacy :meth:`put` method still creates a committed entry so existing
+    callers and old index files remain compatible.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -128,7 +140,18 @@ class IdempotencyStore:
             raise RuntimeError("idempotency state is unreadable") from exc
         if not isinstance(value, dict) or not isinstance(value.get("entries", {}), dict):
             raise RuntimeError("idempotency state is invalid")
-        return {"version": 1, "entries": dict(value.get("entries", {}))}
+        entries: dict[str, Any] = {}
+        for key, raw_entry in dict(value.get("entries", {})).items():
+            if not isinstance(raw_entry, dict):
+                raise RuntimeError("idempotency state is invalid")
+            entry = dict(raw_entry)
+            # Version-one entries were committed by definition.  Treating a
+            # missing state as committed keeps upgrades replay-safe.
+            entry.setdefault("state", "committed")
+            if entry["state"] not in {"pending", "committed"}:
+                raise RuntimeError("idempotency state is invalid")
+            entries[str(key)] = entry
+        return {"version": 1, "entries": entries}
 
     def get(self, scope: str, key: str) -> dict[str, Any] | None:
         normalized = normalize_key(key)
@@ -136,6 +159,141 @@ class IdempotencyStore:
             return None
         with _STORE_LOCK:
             return self._read()["entries"].get(_entry_key(str(scope), normalized))
+
+    @staticmethod
+    def is_pending(entry: dict[str, Any] | None) -> bool:
+        return bool(entry and entry.get("state", "committed") == "pending")
+
+    @staticmethod
+    def is_stale(
+        entry: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+        ttl_seconds: float = DEFAULT_PENDING_TTL_SECONDS,
+    ) -> bool:
+        if not IdempotencyStore.is_pending(entry):
+            return False
+        try:
+            created_at = float(entry.get("created_at", 0.0))
+        except (TypeError, ValueError):
+            return True
+        current = time.time() if now is None else float(now)
+        return current - created_at >= max(0.0, float(ttl_seconds))
+
+    def pending_entries(self) -> list[dict[str, Any]]:
+        """Return pending entries for startup reconciliation."""
+        with _STORE_LOCK:
+            return [dict(entry) for entry in self._read()["entries"].values()
+                    if self.is_pending(entry)]
+
+    def reserve(
+        self,
+        scope: str,
+        key: str,
+        fingerprint: str,
+        resource_id: str | None = None,
+        status_code: int = 202,
+    ) -> dict[str, Any]:
+        """Reserve a stable resource ID before resource creation.
+
+        Repeated reservations for the same semantic request return the first
+        reservation.  A different fingerprint is rejected even when the first
+        request is still pending.
+        """
+        normalized = normalize_key(key)
+        if normalized is None:
+            raise IdempotencyError("Idempotency-Key must not be empty")
+        if not fingerprint:
+            raise IdempotencyError("idempotency fingerprint is required")
+        stable_id = str(resource_id or uuid.uuid4().hex[:12])
+        if not stable_id:
+            raise IdempotencyError("idempotency resource ID is required")
+        with _STORE_LOCK:
+            state = self._read()
+            entry_key = _entry_key(str(scope), normalized)
+            previous = state["entries"].get(entry_key)
+            if previous is not None:
+                if previous.get("fingerprint") != fingerprint:
+                    raise IdempotencyConflict("Idempotency-Key was already used with a different request")
+                return previous
+            now = time.time()
+            entry = {
+                "scope": str(scope),
+                "key": normalized,
+                "fingerprint": fingerprint,
+                "resource_id": stable_id,
+                "status_code": int(status_code),
+                "state": "pending",
+                "created_at": now,
+                "updated_at": now,
+            }
+            state["entries"][entry_key] = entry
+            self._write(state)
+            return entry
+
+    def commit(
+        self,
+        scope: str,
+        key: str,
+        fingerprint: str,
+        resource_id: str,
+        status_code: int = 202,
+    ) -> dict[str, Any]:
+        """Commit a reservation after its durable resource exists."""
+        normalized = normalize_key(key)
+        if normalized is None:
+            raise IdempotencyError("Idempotency-Key must not be empty")
+        if not fingerprint or not resource_id:
+            raise IdempotencyError("idempotency fingerprint and resource ID are required")
+        with _STORE_LOCK:
+            state = self._read()
+            entry_key = _entry_key(str(scope), normalized)
+            previous = state["entries"].get(entry_key)
+            if previous is None:
+                raise IdempotencyReservationError("idempotency reservation is missing")
+            if previous.get("fingerprint") != fingerprint:
+                raise IdempotencyConflict("Idempotency-Key was already used with a different request")
+            if str(previous.get("resource_id")) != str(resource_id):
+                raise IdempotencyReservationError("idempotency resource ID does not match reservation")
+            if previous.get("state", "committed") == "committed":
+                return previous
+            now = time.time()
+            previous = dict(previous)
+            previous.update({"state": "committed", "status_code": int(status_code), "updated_at": now})
+            state["entries"][entry_key] = previous
+            self._write(state)
+            return previous
+
+    def release(
+        self,
+        scope: str,
+        key: str,
+        fingerprint: str,
+        resource_id: str | None = None,
+    ) -> bool:
+        """Release a pending reservation after validation fails.
+
+        Committed entries are retained.  This prevents a late error handler
+        from deleting a mapping for a resource that was already created.
+        """
+        normalized = normalize_key(key)
+        if normalized is None:
+            raise IdempotencyError("Idempotency-Key must not be empty")
+        with _STORE_LOCK:
+            state = self._read()
+            entry_key = _entry_key(str(scope), normalized)
+            previous = state["entries"].get(entry_key)
+            if previous is None:
+                return False
+            if previous.get("fingerprint") != fingerprint:
+                raise IdempotencyConflict("Idempotency-Key was already used with a different request")
+            if resource_id is not None and str(previous.get("resource_id")) != str(resource_id):
+                raise IdempotencyReservationError("idempotency resource ID does not match reservation")
+            if previous.get("state", "committed") != "pending":
+                return False
+            state["entries"].pop(entry_key, None)
+            self._write(state)
+            return True
 
     def put(self, scope: str, key: str, fingerprint: str, resource_id: str, status_code: int = 202) -> dict[str, Any]:
         normalized = normalize_key(key)
@@ -157,6 +315,9 @@ class IdempotencyStore:
                 "fingerprint": fingerprint,
                 "resource_id": str(resource_id),
                 "status_code": int(status_code),
+                "state": "committed",
+                "created_at": time.time(),
+                "updated_at": time.time(),
             }
             state["entries"][entry_key] = entry
             self._write(state)
