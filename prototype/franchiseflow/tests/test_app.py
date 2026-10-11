@@ -55,6 +55,9 @@ class FranchiseFlowAppTests(unittest.TestCase):
         res = self.client.get("/")
         self.assertEqual(res.status_code, 200)
         self.assertIn(b"FranchiseFlow", res.data)
+        self.assertIn(b"/api/jobs", res.data)
+        self.assertIn(b"needs_review", res.data)
+        self.assertIn(b"review-quad", res.data)
 
 
     def test_missing_video_returns_400(self):

@@ -40,10 +40,10 @@
       <section class="card panel-input">
         <div class="card-header">
           <h3 class="card-title">1. 上传素材与配置</h3>
-          <span class="card-subtitle">单视频 + 三分支素材</span>
+          <span class="card-subtitle">单视频 + 1 到 10 个分支素材</span>
         </div>
 
-        <form id="render-form" class="render-form">
+        <form id="render-form" class="render-form" data-job-endpoint="/api/jobs" data-review-state="needs_review">
           <div class="form-group">
             <label class="form-label" for="video-input">
               <span>门店移动视频 (MP4)</span>
@@ -63,25 +63,12 @@
 
           <div class="form-group">
             <label class="form-label">
-              <span>三分支招牌素材 (PNG/JPG)</span>
-              <span class="label-hint">必须提供 3 张</span>
+              <span>分支招牌素材 (PNG/JPG)</span>
+              <span class="label-hint">至少 1 张，最多 10 张</span>
             </label>
-            <div class="branches-grid">
-              <div class="branch-upload-box" id="branch-box-1">
-                <label for="branch-input-1" class="branch-label">分支 1 (如滨河路店)</label>
-                <input type="file" id="branch-input-1" name="branch_1" accept="image/png,image/jpeg" required>
-                <div class="branch-file-name" id="branch-name-1">选择图片 1</div>
-              </div>
-              <div class="branch-upload-box" id="branch-box-2">
-                <label for="branch-input-2" class="branch-label">分支 2 (如市中心店)</label>
-                <input type="file" id="branch-input-2" name="branch_2" accept="image/png,image/jpeg" required>
-                <div class="branch-file-name" id="branch-name-2">选择图片 2</div>
-              </div>
-              <div class="branch-upload-box" id="branch-box-3">
-                <label for="branch-input-3" class="branch-label">分支 3 (如北园店)</label>
-                <input type="file" id="branch-input-3" name="branch_3" accept="image/png,image/jpeg" required>
-                <div class="branch-file-name" id="branch-name-3">选择图片 3</div>
-              </div>
+            <div class="branches-grid" id="branches-list"></div>
+            <button type="button" id="btn-add-branch" class="btn btn-secondary">添加分支</button>
+            <p class="mode-tip">视频中的招牌素材会分别生成独立 MP4，输入有音频时保留原音轨。</p>
             </div>
           </div>
 
@@ -138,6 +125,12 @@
               <span class="metric-label">处理总帧数</span>
               <span class="metric-value" id="metric-frames">-</span>
             </div>
+            <div class="review-panel" id="review-panel" hidden>
+              <strong>需要人工确认</strong>
+              <p id="review-reasons">模型候选没有通过三帧几何检查。</p>
+              <p>拖动预览中的四个角点，再提交本次确认。</p>
+              <button type="button" id="review-quad" class="btn btn-primary">提交人工确认</button>
+            </div>
             <div class="metric-item">
               <span class="metric-label">耗时 / 处理速度</span>
               <span class="metric-value" id="metric-time">-</span>
@@ -167,51 +160,12 @@
     <section class="card output-section" id="output-section">
       <div class="card-header">
         <div>
-          <h3 class="card-title">3. 分支渲染结果预览 (三路同步导出)</h3>
-          <span class="card-subtitle">每一帧根据估计单应矩阵进行亚像素透视合成，失败帧自动保底原片</span>
+          <h3 class="card-title">3. 分支渲染结果预览</h3>
+          <span class="card-subtitle">每个分支都会生成一条 H.264 MP4，失败帧保留原画</span>
         </div>
       </div>
 
-      <div class="outputs-grid" id="outputs-grid">
-        <div class="output-card" id="output-card-1">
-          <div class="output-card-header">
-            <span class="branch-tag">Branch 1</span>
-            <span class="branch-title" id="output-title-1">分支门店 1</span>
-          </div>
-          <div class="video-container">
-            <video id="video-player-1" controls playsinline loop></video>
-          </div>
-          <div class="output-actions">
-            <a id="download-link-1" class="btn btn-outline" download>下载成片 MP4</a>
-          </div>
-        </div>
-
-        <div class="output-card" id="output-card-2">
-          <div class="output-card-header">
-            <span class="branch-tag">Branch 2</span>
-            <span class="branch-title" id="output-title-2">分支门店 2</span>
-          </div>
-          <div class="video-container">
-            <video id="video-player-2" controls playsinline loop></video>
-          </div>
-          <div class="output-actions">
-            <a id="download-link-2" class="btn btn-outline" download>下载成片 MP4</a>
-          </div>
-        </div>
-
-        <div class="output-card" id="output-card-3">
-          <div class="output-card-header">
-            <span class="branch-tag">Branch 3</span>
-            <span class="branch-title" id="output-title-3">分支门店 3</span>
-          </div>
-          <div class="video-container">
-            <video id="video-player-3" controls playsinline loop></video>
-          </div>
-          <div class="output-actions">
-            <a id="download-link-3" class="btn btn-outline" download>下载成片 MP4</a>
-          </div>
-        </div>
-      </div>
+      <div class="outputs-grid" id="outputs-grid"></div>
     </section>
   </main>
 

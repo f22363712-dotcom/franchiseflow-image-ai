@@ -2,27 +2,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const form = document.getElementById('render-form');
   const videoInput = document.getElementById('video-input');
   const videoFileName = document.getElementById('video-file-name');
-  const branchInputs = [
-    document.getElementById('branch-input-1'),
-    document.getElementById('branch-input-2'),
-    document.getElementById('branch-input-3')
-  ];
-  const branchNames = [
-    document.getElementById('branch-name-1'),
-    document.getElementById('branch-name-2'),
-    document.getElementById('branch-name-3')
-  ];
-
+  const branchesList = document.getElementById('branches-list');
+  const addBranchButton = document.getElementById('btn-add-branch');
   const btnSubmit = document.getElementById('btn-submit');
   const btnSpinner = document.getElementById('btn-spinner');
   const btnText = btnSubmit.querySelector('.btn-text');
   const btnLoadSample = document.getElementById('btn-load-sample');
-
   const quadStatusBadge = document.getElementById('quad-status-badge');
-  const canvasWrapper = document.getElementById('canvas-wrapper');
   const placeholderPreview = document.getElementById('placeholder-preview');
   const previewCanvas = document.getElementById('preview-canvas');
-
+  const reviewPanel = document.getElementById('review-panel');
+  const reviewReasons = document.getElementById('review-reasons');
+  const reviewButton = document.getElementById('review-quad');
+  const outputsGrid = document.getElementById('outputs-grid');
   const metricFrames = document.getElementById('metric-frames');
   const metricTime = document.getElementById('metric-time');
   const metricInliers = document.getElementById('metric-inliers');
@@ -30,224 +22,267 @@ document.addEventListener('DOMContentLoaded', () => {
   const metricFailed = document.getElementById('metric-failed');
   const metricInitMode = document.getElementById('metric-init-mode');
 
-  const videoPlayers = [
-    document.getElementById('video-player-1'),
-    document.getElementById('video-player-2'),
-    document.getElementById('video-player-3')
-  ];
-  const downloadLinks = [
-    document.getElementById('download-link-1'),
-    document.getElementById('download-link-2'),
-    document.getElementById('download-link-3')
-  ];
+  let branchInputs = [];
+  let activeJobId = null;
+  let reviewQuad = null;
+  let dragIndex = -1;
 
-  // Update file name display
-  videoInput.addEventListener('change', (e) => {
-    if (e.target.files && e.target.files[0]) {
-      videoFileName.textContent = e.target.files[0].name;
-      drawVideoFirstFrame(e.target.files[0]);
+  function addBranchInput() {
+    if (branchInputs.length >= 10) return;
+    const index = branchInputs.length + 1;
+    const row = document.createElement('div');
+    row.className = 'branch-upload-box';
+    row.dataset.index = String(index);
+    row.innerHTML = `
+      <label class="branch-label" for="branch-input-${index}">分支 ${index}</label>
+      <input type="file" id="branch-input-${index}" name="branches" accept="image/png,image/jpeg">
+      <div class="branch-file-name">选择图片 ${index}</div>
+      <button type="button" class="branch-remove btn btn-outline">移除</button>`;
+    const input = row.querySelector('input');
+    const name = row.querySelector('.branch-file-name');
+    input.addEventListener('change', () => {
+      name.textContent = input.files[0] ? input.files[0].name : `选择图片 ${index}`;
+    });
+    row.querySelector('.branch-remove').addEventListener('click', () => {
+      row.remove();
+      branchInputs = branchInputs.filter(item => item !== input);
+      renumberBranches();
+    });
+    branchesList.appendChild(row);
+    branchInputs.push(input);
+    updateAddButton();
+  }
+
+  function renumberBranches() {
+    [...branchesList.children].forEach((row, i) => {
+      const index = i + 1;
+      row.dataset.index = String(index);
+      row.querySelector('.branch-label').textContent = `分支 ${index}`;
+      row.querySelector('input').id = `branch-input-${index}`;
+      row.querySelector('.branch-label').htmlFor = `branch-input-${index}`;
+    });
+    updateAddButton();
+  }
+
+  function updateAddButton() {
+    addBranchButton.disabled = branchInputs.length >= 10;
+    addBranchButton.textContent = branchInputs.length >= 10 ? '已达到 10 个分支上限' : '添加分支';
+  }
+
+  for (let i = 0; i < 3; i++) addBranchInput();
+  addBranchButton.addEventListener('click', addBranchInput);
+
+  videoInput.addEventListener('change', () => {
+    if (videoInput.files[0]) {
+      videoFileName.textContent = videoInput.files[0].name;
+      drawVideoFirstFrame(videoInput.files[0], reviewQuad);
     }
   });
 
-  branchInputs.forEach((input, index) => {
-    input.addEventListener('change', (e) => {
-      if (e.target.files && e.target.files[0]) {
-        branchNames[index].textContent = e.target.files[0].name;
-      }
-    });
-  });
+  function setStatus(text, className = 'badge badge-tech') {
+    quadStatusBadge.textContent = text;
+    quadStatusBadge.className = className;
+  }
 
-  // Extract first frame of video for client-side preview
-  function drawVideoFirstFrame(videoFile, quad = null) {
+  function drawQuadOverlay(ctx, quad, editable = false) {
+    if (!quad || quad.length !== 4) return;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#06b6d4';
+    ctx.fillStyle = 'rgba(6, 182, 212, 0.2)';
+    ctx.beginPath();
+    ctx.moveTo(quad[0][0], quad[0][1]);
+    for (let i = 1; i < 4; i++) ctx.lineTo(quad[i][0], quad[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fill();
+    quad.forEach((point, index) => {
+      ctx.fillStyle = editable ? '#f59e0b' : '#ffffff';
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], editable ? 9 : 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 12px Inter, sans-serif';
+      ctx.fillText(['TL', 'TR', 'BR', 'BL'][index], point[0] + 10, point[1] - 5);
+    });
+  }
+
+  function drawVideoFirstFrame(file, quad = null) {
     const video = document.createElement('video');
     video.preload = 'metadata';
-    video.src = URL.createObjectURL(videoFile);
     video.muted = true;
     video.playsInline = true;
-
-    video.onloadeddata = () => {
-      video.currentTime = 0;
-    };
-
+    video.src = URL.createObjectURL(file);
+    video.onloadeddata = () => { video.currentTime = 0; };
     video.onseeked = () => {
       placeholderPreview.style.display = 'none';
       previewCanvas.style.display = 'block';
-
-      const ctx = previewCanvas.getContext('2d');
       previewCanvas.width = video.videoWidth || 640;
       previewCanvas.height = video.videoHeight || 360;
-
+      const ctx = previewCanvas.getContext('2d');
       ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-
-      if (quad && quad.length === 4) {
-        drawQuadOverlay(ctx, quad);
-      }
+      drawQuadOverlay(ctx, quad, Boolean(reviewPanel && !reviewPanel.hidden));
       URL.revokeObjectURL(video.src);
     };
   }
 
-  function drawQuadOverlay(ctx, quad) {
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#06b6d4';
-    ctx.fillStyle = 'rgba(6, 182, 212, 0.2)';
+  function drawSampleFrame(url, quad) {
+    const image = new Image();
+    image.onload = () => {
+      placeholderPreview.style.display = 'none';
+      previewCanvas.style.display = 'block';
+      previewCanvas.width = image.width;
+      previewCanvas.height = image.height;
+      const ctx = previewCanvas.getContext('2d');
+      ctx.drawImage(image, 0, 0);
+      drawQuadOverlay(ctx, quad, false);
+    };
+    image.src = url;
+  }
 
-    ctx.beginPath();
-    ctx.moveTo(quad[0][0], quad[0][1]);
-    for (let i = 1; i < 4; i++) {
-      ctx.lineTo(quad[i][0], quad[i][1]);
-    }
-    ctx.closePath();
-    ctx.stroke();
-    ctx.fill();
+  function updateMetrics(summary, mode) {
+    metricFrames.textContent = summary.frames ? `${summary.frames} 帧 (${summary.fps || 0} fps)` : '-';
+    metricTime.textContent = summary.processing_seconds != null ? `${summary.processing_seconds}s` : '-';
+    metricInliers.textContent = summary.median_inliers != null ? Math.round(summary.median_inliers) : '-';
+    metricReproj.textContent = summary.reprojection_median_px != null ? `${summary.reprojection_median_px.toFixed(2)} px` : '-';
+    metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧` : '-';
+    metricInitMode.textContent = mode || summary.initialization_mode || '-';
+  }
 
-    const labels = ['TL', 'TR', 'BR', 'BL'];
-    quad.forEach((pt, idx) => {
-      ctx.fillStyle = '#f59e0b';
-      ctx.beginPath();
-      ctx.arc(pt[0], pt[1], 5, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.font = 'bold 12px Inter, sans-serif';
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(`${labels[idx]} (${Math.round(pt[0])}, ${Math.round(pt[1])})`, pt[0] + 8, pt[1] - 4);
+  function renderOutputs(urls) {
+    outputsGrid.innerHTML = '';
+    (urls || []).forEach((url, index) => {
+      const card = document.createElement('div');
+      card.className = 'output-card';
+      card.innerHTML = `<div class="output-card-header"><span class="branch-tag">Branch ${index + 1}</span><span class="branch-title">分支门店 ${index + 1}</span></div><div class="video-container"><video controls playsinline loop></video></div><div class="output-actions"><a class="btn btn-outline" download>下载成片 MP4</a></div>`;
+      const player = card.querySelector('video');
+      const link = card.querySelector('a');
+      player.src = url;
+      player.addEventListener('error', () => {
+        card.querySelector('.branch-title').textContent += '（浏览器无法播放）';
+      });
+      link.href = url;
+      link.download = `branch_${index + 1}.mp4`;
+      outputsGrid.appendChild(card);
     });
   }
 
-  // Sample loader helper: load prebuilt verified demo results
-  btnLoadSample.addEventListener('click', async () => {
-    try {
-      btnLoadSample.disabled = true;
-      btnLoadSample.textContent = '正在载入样片...';
-      const res = await fetch('/api/demo_results');
-      if (!res.ok) {
-        throw new Error(`加载失败: HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      quadStatusBadge.textContent = '样片就绪';
-      quadStatusBadge.className = 'badge badge-status';
+  function showReview(job) {
+    reviewQuad = job.candidate && job.candidate.quad ? job.candidate.quad.map(point => point.slice()) : null;
+    reviewPanel.hidden = false;
+    reviewReasons.textContent = (job.validation && job.validation.reasons ? job.validation.reasons.join('、') : job.error || '候选没有通过三帧检查。');
+    if (videoInput.files[0]) drawVideoFirstFrame(videoInput.files[0], reviewQuad);
+    else if (job.sample_preview) drawSampleFrame(job.sample_preview, reviewQuad);
+  }
 
-      const summary = data.summary || {};
-      metricFrames.textContent = `${summary.frames || 144} 帧 (${summary.fps || 24} fps)`;
-      metricTime.textContent = `${summary.processing_seconds || 122.08}s (含转码)`;
-      metricInliers.textContent = summary.median_inliers ? Math.round(summary.median_inliers) : '113';
-      metricReproj.textContent = summary.reprojection_median_px ? `${summary.reprojection_median_px.toFixed(2)} px` : '0.36 px';
-      metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧` : '0 帧';
-      metricInitMode.textContent = '人工校准基线 (Manual)';
-
-      // Draw canvas preview
-      const quad = data.vision_quad;
-      placeholderPreview.style.display = 'none';
-      previewCanvas.style.display = 'block';
-      const ctx = previewCanvas.getContext('2d');
-      const img = new Image();
-      img.onload = () => {
-        previewCanvas.width = img.width;
-        previewCanvas.height = img.height;
-        ctx.drawImage(img, 0, 0);
-        if (quad) drawQuadOverlay(ctx, quad);
-      };
-      img.src = '/static/sample_first_frame.jpg';
-
-      if (data.outputs && data.outputs.length === 3) {
-        data.outputs.forEach((url, i) => {
-          videoPlayers[i].src = url;
-          videoPlayers[i].load();
-          videoPlayers[i].play().catch(() => {});
-          downloadLinks[i].href = url;
-          downloadLinks[i].download = `branch_${i + 1}.mp4`;
-        });
-      }
-      btnLoadSample.textContent = '已载入样例';
-    } catch (err) {
-      alert('载入样片失败: ' + err.message);
-      btnLoadSample.textContent = '载入默认样例素材';
-    } finally {
-      btnLoadSample.disabled = false;
-    }
+  previewCanvas.addEventListener('pointerdown', event => {
+    if (!reviewQuad) return;
+    const rect = previewCanvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * previewCanvas.width / rect.width;
+    const y = (event.clientY - rect.top) * previewCanvas.height / rect.height;
+    dragIndex = reviewQuad.reduce((best, point, index) => {
+      const distance = Math.hypot(point[0] - x, point[1] - y);
+      return distance < Math.hypot(reviewQuad[best][0] - x, reviewQuad[best][1] - y) ? index : best;
+    }, 0);
+    previewCanvas.setPointerCapture(event.pointerId);
   });
+  previewCanvas.addEventListener('pointermove', event => {
+    if (dragIndex < 0 || !reviewQuad) return;
+    const rect = previewCanvas.getBoundingClientRect();
+    reviewQuad[dragIndex] = [
+      Math.max(0, Math.min(previewCanvas.width - 1, (event.clientX - rect.left) * previewCanvas.width / rect.width)),
+      Math.max(0, Math.min(previewCanvas.height - 1, (event.clientY - rect.top) * previewCanvas.height / rect.height)),
+    ];
+    const ctx = previewCanvas.getContext('2d');
+    ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+    drawQuadOverlay(ctx, reviewQuad, true);
+  });
+  previewCanvas.addEventListener('pointerup', () => { dragIndex = -1; });
 
-  // Submit Handler
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    if (!videoInput.files[0]) {
-      alert('请先选择 MP4 门店视频');
+  async function pollJob(jobId) {
+    activeJobId = jobId;
+    const response = await fetch(`/api/jobs/${jobId}`);
+    const job = await response.json();
+    if (!response.ok) throw new Error(job.error || '读取任务状态失败');
+    setStatus(`${job.status} · ${job.phase || ''}`.trim());
+    if (job.status === 'queued' || job.status === 'running') {
+      window.setTimeout(() => pollJob(jobId).catch(showError), 750);
       return;
     }
-    for (let i = 0; i < 3; i++) {
-      if (!branchInputs[i].files[0]) {
-        alert(`请选择分支 ${i + 1} 的招牌图片`);
-        return;
-      }
+    if (job.status === 'needs_review') {
+      showReview(job);
+      return;
     }
+    if (job.status === 'completed') {
+      reviewPanel.hidden = true;
+      setStatus('合成完成', 'badge badge-status');
+      updateMetrics(job.summary || {}, job.initialization_mode);
+      renderOutputs(job.outputs || []);
+      return;
+    }
+    throw new Error(job.error || '任务失败');
+  }
 
-    const isManual = document.getElementById('mode-manual').checked;
+  function showError(error) {
+    setStatus('处理失败', 'badge');
+    alert(`合成任务失败：${error.message}`);
+  }
 
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const files = branchInputs.map(input => input.files[0]).filter(Boolean);
+    if (!videoInput.files[0]) return alert('请先选择 MP4 门店视频');
+    if (!files.length) return alert('请至少选择一张分支招牌图片');
     const formData = new FormData();
     formData.append('video', videoInput.files[0]);
-    formData.append('branch_1', branchInputs[0].files[0]);
-    formData.append('branch_2', branchInputs[1].files[0]);
-    formData.append('branch_3', branchInputs[2].files[0]);
-    formData.append('use_manual_quad', isManual ? 'true' : 'false');
-
-    // UI Loading State
+    files.forEach(file => formData.append('branches', file));
+    const manual = document.getElementById('mode-manual').checked;
+    formData.append('use_manual_quad', manual ? 'true' : 'false');
     btnSubmit.disabled = true;
     btnSpinner.style.display = 'inline-block';
-    btnText.textContent = isManual ? '正在使用人工校准基线跟踪合成...' : '正在调用视觉定位初筛与跟踪合成...';
-    quadStatusBadge.textContent = '处理中...';
-    quadStatusBadge.className = 'badge badge-tech';
-
+    btnText.textContent = '任务已提交，等待处理...';
+    setStatus('queued');
     try {
-      const response = await fetch('/api/render', {
-        method: 'POST',
-        body: formData
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || `请求失败 (HTTP ${response.status})`);
-      }
-
-      // Success
-      quadStatusBadge.textContent = '合成完成';
-      quadStatusBadge.className = 'badge badge-status';
-
-      // Update metrics
-      const summary = data.summary || {};
-      metricFrames.textContent = `${summary.frames || 0} 帧 (${summary.fps || 24} fps)`;
-      metricTime.textContent = `${summary.processing_seconds || 0}s`;
-      metricInliers.textContent = summary.median_inliers ? Math.round(summary.median_inliers) : 'N/A';
-      metricReproj.textContent = summary.reprojection_median_px ? `${summary.reprojection_median_px.toFixed(2)} px` : 'N/A';
-      metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧 (${((summary.failed_fraction || 0) * 100).toFixed(1)}%)` : '0';
-      metricInitMode.textContent = data.initialization_mode === 'vision_model' ? '视觉模型初筛 (Vision AI)' : '人工校准基线 (Manual)';
-
-      // Draw quad on canvas
-      if (data.vision_quad && videoInput.files[0]) {
-        drawVideoFirstFrame(videoInput.files[0], data.vision_quad);
-      }
-
-      // Populate video players
-      if (data.outputs && data.outputs.length === 3) {
-        data.outputs.forEach((url, i) => {
-          videoPlayers[i].src = url;
-          videoPlayers[i].load();
-          downloadLinks[i].href = url;
-        });
-      }
-
-    } catch (err) {
-      console.error(err);
-      quadStatusBadge.textContent = '处理失败';
-      quadStatusBadge.className = 'badge';
-      quadStatusBadge.style.color = '#ef4444';
-      quadStatusBadge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
-
-      alert(`合成任务失败: ${err.message}\n\n提示：若为视觉网关 403 错误，可选择“手动基线兜底”继续本地高质量几何跟踪。`);
+      const response = await fetch('/api/jobs', { method: 'POST', body: formData });
+      const job = await response.json();
+      if (!response.ok) throw new Error(job.error || `请求失败 (HTTP ${response.status})`);
+      await pollJob(job.job_id);
+    } catch (error) {
+      showError(error);
     } finally {
       btnSubmit.disabled = false;
       btnSpinner.style.display = 'none';
       btnText.textContent = '开始跟踪与分支合成';
+    }
+  });
+
+  reviewButton.addEventListener('click', async () => {
+    if (!activeJobId || !reviewQuad) return;
+    reviewButton.disabled = true;
+    try {
+      const response = await fetch(`/api/jobs/${activeJobId}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quad: reviewQuad }) });
+      const job = await response.json();
+      if (!response.ok) throw new Error(job.error || '提交人工确认失败');
+      reviewPanel.hidden = true;
+      await pollJob(activeJobId);
+    } catch (error) {
+      showError(error);
+    } finally {
+      reviewButton.disabled = false;
+    }
+  });
+
+  btnLoadSample.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/api/demo_results');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '样片不存在');
+      setStatus('样片就绪', 'badge badge-status');
+      updateMetrics(data.summary || {}, data.initialization_mode || 'manual_fallback');
+      drawSampleFrame('/static/sample_first_frame.jpg', data.vision_quad);
+      renderOutputs(data.outputs || []);
+      btnLoadSample.textContent = '已载入样例';
+    } catch (error) {
+      showError(error);
     }
   });
 });
