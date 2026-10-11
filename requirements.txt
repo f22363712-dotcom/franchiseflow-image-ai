@@ -1,4 +1,5 @@
 Flask>=3.0,<4
+waitress>=3.0,<4
 numpy>=1.26,<3
 opencv-python>=4.8,<5
 Pillow>=10,<12

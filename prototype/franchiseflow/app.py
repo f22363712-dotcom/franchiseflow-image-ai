@@ -40,6 +40,7 @@ from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_qu
 from scene_samples import sample_video_scenes
 from scene_reuse import transfer_candidate
 from vision_client import VisionClient
+from runtime_health import build_health_snapshot, server_bind
 from input_media import (
     SUPPORTED_SOURCE_EXTS,
     inspect_video,
@@ -1546,7 +1547,7 @@ def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
 def _recover_jobs_for_wsgi() -> None:
     """Recover durable work when the module is loaded by a WSGI server."""
     global _RECOVERY_STARTED
-    if app.config.get("TESTING") or _RECOVERY_STARTED:
+    if app.config.get("TESTING") or _RECOVERY_STARTED or request.endpoint == "health_endpoint":
         return
     _RECOVERY_STARTED = True
     _recover_jobs()
@@ -1555,6 +1556,31 @@ def _recover_jobs_for_wsgi() -> None:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/health", methods=["GET"])
+def health_endpoint():
+    """Inspect local readiness without triggering recovery or writing state."""
+    with SYNC_LOCK:
+        with FUTURE_LOCK:
+            pending = [future for future in FUTURES.values() if not future.done()]
+            active = SYNC_ACTIVE + sum(1 for future in pending if future.running())
+    snapshot = build_health_snapshot(
+        upload_dir=UPLOAD_DIR,
+        output_dir=OUTPUT_DIR,
+        profile_dir=PROFILE_DIR,
+        batch_dir=BATCH_DIR,
+        package_dir=BATCH_PACKAGE_DIR,
+        idempotency_store=IDEMPOTENCY_STORE,
+        worker_active=active,
+        worker_scheduled=len(pending),
+        worker_capacity=MAX_ACTIVE_JOBS,
+        recovery_started=_RECOVERY_STARTED,
+    )
+    response = jsonify(snapshot)
+    response.status_code = 200 if snapshot["status"] == "healthy" else 503
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/brand-profiles", methods=["POST"])
@@ -2243,5 +2269,6 @@ def serve_job_output(job_id: str, filename: str):
 
 
 if __name__ == "__main__":
+    host, port = server_bind()
     _recover_jobs()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=host, port=port, debug=False)

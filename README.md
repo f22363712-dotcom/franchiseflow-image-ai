@@ -41,6 +41,31 @@ python prototype/franchiseflow/app.py
 
 视频输入支持 `.mp4`、`.mov`、`.m4v`、`.webm`、`.avi` 和 `.mkv`。非 MP4 源以及检测到 HEVC、H.265、ProRes、AV1、未知编码或非 `yuv420p` 像素格式的 MP4 会在任务创建时保留原文件，并用 FFmpeg 生成 `processing_input.mp4`（H.264、`yuv420p`、可选 AAC 音轨）供 OpenCV 和跟踪器使用。任务 JSON 与 `manifest.json` 会记录原始扩展名、工作文件名和解码器可见的尺寸、帧率、时长估计；场景采样阶段再顺序解码并记录实际帧数。
 
+### 单机部署
+
+安装依赖后，可以用单进程 Waitress 启动服务。`HOST` 默认为 `127.0.0.1`，`PORT` 默认为 `5000`；开发入口 `app.py` 也读取这两个环境变量。
+
+```bash
+python prototype/franchiseflow/server.py
+```
+
+容器镜像使用 Python 3.11、FFmpeg/FFprobe、非 root 用户和单进程 Waitress。构建上下文排除 `.env`、上传文件、生成物和旧探索目录。API 配置通过运行时环境变量传入。
+
+```bash
+docker build -t franchiseflow:local .
+docker run --name franchiseflow -p 127.0.0.1:5000:5000 --env-file .env \
+  -v franchiseflow-uploads:/app/prototype/franchiseflow/uploads \
+  -v franchiseflow-outputs:/app/prototype/franchiseflow/outputs \
+  -v franchiseflow-profiles:/app/prototype/franchiseflow/brand_profiles \
+  franchiseflow:local
+```
+
+这三个命名卷分别保存原始素材、任务/批次/幂等状态及成片、品牌配置。重新创建容器时复用同名卷，服务会恢复排队任务。使用宿主机目录挂载时，需要保证容器中的 UID/GID `10001` 可以写入对应目录。
+
+`GET /api/health` 提供版本、当前运行数、持久化排队数、FFmpeg/FFprobe 可用性和目录权限。持久化 JSON 不可读、工具缺失或目录不可写时返回 HTTP 503，其余返回 HTTP 200。接口不启动恢复、不写文件，也不返回任务 ID、绝对路径、环境变量或 API key。目录可写性来自权限检查，磁盘容量与后续写入仍可能发生变化。容器健康检查每 30 秒调用一次这个接口。
+
+本地 JSON 和线程锁要求单个应用进程；当前镜像只运行一个服务实例。多副本部署需要共享数据库和任务队列。当前服务没有登录和团队权限，部署在受控网络中，公网接入需要先增加身份验证。
+
 ### API key
 
 复制 `.env.example` 为 `.env`，只在本地填写：
