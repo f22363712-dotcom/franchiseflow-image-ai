@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--preview", type=Path)
+    parser.add_argument("--target-hint", type=str, default=None, help="Optional text description of target sign")
     args = parser.parse_args()
 
     if not args.image.exists():
@@ -31,7 +32,7 @@ def main() -> None:
     height, width = image.shape[:2]
     try:
         client = VisionClient()
-        result = client.locate_sign(args.image.read_bytes(), width, height)
+        result = client.locate_sign(args.image.read_bytes(), width, height, target_hint=args.target_hint)
     except Exception as exc:
         sys.stderr.write(f"Vision API error: {exc}\n")
         if args.out_json.exists():

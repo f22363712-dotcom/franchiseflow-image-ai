@@ -3,6 +3,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import cv2
@@ -130,6 +131,14 @@ class TrackerSyntheticTests(unittest.TestCase):
         video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
         with self.assertRaises(ValueError):
             run_tracker(video_path, quad, signs[:2], self.temp_dir / "out")
+
+
+    @patch("shutil.which", return_value=None)
+    def test_ffmpeg_missing_raises_runtime_error(self, mock_which):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
+        with self.assertRaises(RuntimeError) as ctx:
+            run_tracker(video_path, quad, signs, self.temp_dir / "out")
+        self.assertIn("FFmpeg is required", str(ctx.exception))
 
 
 if __name__ == "__main__":

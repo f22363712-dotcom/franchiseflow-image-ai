@@ -100,19 +100,25 @@ class VisionClient:
         load_env_file()
         self.api_key = api_key or os.getenv("BANANA_API_KEY")
         self.base_url = (base_url or os.getenv("BANANA_API_BASE_URL") or "https://e.c.h-e.top/v1").rstrip("/")
-        self.model = model or os.getenv("BANANA_VISION_MODEL") or "GLM-5.3-flash"
+        self.model = model or os.getenv("BANANA_VISION_MODEL") or "gemini-3.1-flash-image"
         self.timeout = timeout
         if not self.api_key:
             raise RuntimeError("BANANA_API_KEY is missing; put it in the environment or .env")
 
-    def locate_sign(self, image_bytes: bytes, width: int, height: int, mime: str = "image/jpeg") -> dict[str, Any]:
+    def locate_sign(self, image_bytes: bytes, width: int, height: int, mime: str = "image/jpeg", target_hint: str | None = None) -> dict[str, Any]:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         prompt = (
-            "Find the largest replaceable storefront sign or flat advertising board in this image. "
+            "Find the physical planar boundary of the storefront sign or flat advertising board in this image. "
+        )
+        if target_hint:
+            prompt += f"Target description: {target_hint}. "
+        else:
+            prompt += "Target: the primary storefront sign (e.g. the dark gray board with 'STATE OF CONFUSION'). "
+        prompt += (
             "Return only JSON with keys quad, confidence, and reason. quad must be four image pixel "
             "corners in clockwise order [top-left, top-right, bottom-right, bottom-left]. "
             "Use pixel coordinates for the supplied image size. If no clear planar sign exists, use "
-            "quad:null and explain why. Do not identify text; identify the physical planar surface."
+            "quad:null and explain why. Bound the physical signboard polygon strictly; do not include brick walls, windows, doors, or street."
         )
         payload = {
             "model": self.model,

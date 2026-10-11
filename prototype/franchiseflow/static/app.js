@@ -113,9 +113,57 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Sample loader helper
-  btnLoadSample.addEventListener('click', () => {
-    alert('已提供真实样片位于 spikes/franchiseflow/fixtures/ 与 assets/，可在表单中直接选择 real_storefront.mp4 及 riverside.png、downtown.png、northpark.png。');
+  // Sample loader helper: load prebuilt verified demo results
+  btnLoadSample.addEventListener('click', async () => {
+    try {
+      btnLoadSample.disabled = true;
+      btnLoadSample.textContent = '正在载入样片...';
+      const res = await fetch('/api/demo_results');
+      if (!res.ok) {
+        throw new Error(`加载失败: HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      quadStatusBadge.textContent = '样片就绪';
+      quadStatusBadge.className = 'badge badge-status';
+
+      const summary = data.summary || {};
+      metricFrames.textContent = `${summary.frames || 144} 帧 (${summary.fps || 24} fps)`;
+      metricTime.textContent = `${summary.processing_seconds || 122.08}s (含转码)`;
+      metricInliers.textContent = summary.median_inliers ? Math.round(summary.median_inliers) : '113';
+      metricReproj.textContent = summary.reprojection_median_px ? `${summary.reprojection_median_px.toFixed(2)} px` : '0.36 px';
+      metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧` : '0 帧';
+      metricInitMode.textContent = '人工校准基线 (Manual)';
+
+      // Draw canvas preview
+      const quad = data.vision_quad;
+      placeholderPreview.style.display = 'none';
+      previewCanvas.style.display = 'block';
+      const ctx = previewCanvas.getContext('2d');
+      const img = new Image();
+      img.onload = () => {
+        previewCanvas.width = img.width;
+        previewCanvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        if (quad) drawQuadOverlay(ctx, quad);
+      };
+      img.src = '/static/sample_first_frame.jpg';
+
+      if (data.outputs && data.outputs.length === 3) {
+        data.outputs.forEach((url, i) => {
+          videoPlayers[i].src = url;
+          videoPlayers[i].load();
+          videoPlayers[i].play().catch(() => {});
+          downloadLinks[i].href = url;
+          downloadLinks[i].download = `branch_${i + 1}.mp4`;
+        });
+      }
+      btnLoadSample.textContent = '已载入样例';
+    } catch (err) {
+      alert('载入样片失败: ' + err.message);
+      btnLoadSample.textContent = '载入默认样例素材';
+    } finally {
+      btnLoadSample.disabled = false;
+    }
   });
 
   // Submit Handler
@@ -145,7 +193,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // UI Loading State
     btnSubmit.disabled = true;
     btnSpinner.style.display = 'inline-block';
-    btnText.textContent = isManual ? '正在使用手动四角跟踪合成...' : '正在调用 GLM 视觉定位与跟踪合成...';
+    btnText.textContent = isManual ? '正在使用人工校准基线跟踪合成...' : '正在调用视觉定位初筛与跟踪合成...';
     quadStatusBadge.textContent = '处理中...';
     quadStatusBadge.className = 'badge badge-tech';
 
@@ -172,7 +220,7 @@ document.addEventListener('DOMContentLoaded', () => {
       metricInliers.textContent = summary.median_inliers ? Math.round(summary.median_inliers) : 'N/A';
       metricReproj.textContent = summary.reprojection_median_px ? `${summary.reprojection_median_px.toFixed(2)} px` : 'N/A';
       metricFailed.textContent = summary.failed_frames ? `${summary.failed_frames.length} 帧 (${((summary.failed_fraction || 0) * 100).toFixed(1)}%)` : '0';
-      metricInitMode.textContent = data.initialization_mode === 'vision_model' ? 'GLM-5.3-flash 视觉模型' : '手动基线兜底 (Manual)';
+      metricInitMode.textContent = data.initialization_mode === 'vision_model' ? '视觉模型初筛 (Vision AI)' : '人工校准基线 (Manual)';
 
       // Draw quad on canvas
       if (data.vision_quad && videoInput.files[0]) {

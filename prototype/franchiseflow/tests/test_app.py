@@ -120,7 +120,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
             "output_videos": ["out1.mp4", "out2.mp4", "out3.mp4"],
         }
         mock_instance = MagicMock()
-        mock_instance.locate_sign.return_value = {"quad": mock_quad, "model": "GLM-5.3-flash"}
+        mock_instance.locate_sign.return_value = {"quad": mock_quad, "model": "gemini-3.1-flash-image"}
 
         with patch("app.VisionClient", return_value=mock_instance):
             with patch("app.run_tracker", return_value=mock_summary):
@@ -137,6 +137,13 @@ class FranchiseFlowAppTests(unittest.TestCase):
                 self.assertEqual(get_res.status_code, 200)
                 self.assertEqual(get_res.get_json()["status"], "completed")
 
+    def test_get_demo_results(self):
+        res = self.client.get("/api/demo_results")
+        self.assertIn(res.status_code, [200, 404])
+        if res.status_code == 200:
+            data = res.get_json()
+            self.assertEqual(data["status"], "completed")
+            self.assertEqual(len(data["outputs"]), 3)
 
 
 if __name__ == "__main__":

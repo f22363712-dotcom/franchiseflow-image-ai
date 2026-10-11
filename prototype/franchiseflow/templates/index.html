@@ -22,7 +22,7 @@
         </div>
       </div>
       <div class="header-badges">
-        <span class="badge badge-tech" id="tech-badge">GLM-5.3-flash + OpenCV SIFT</span>
+        <span class="badge badge-tech" id="tech-badge">Gemini-3.1-Flash + OpenCV SIFT</span>
         <span class="badge badge-status" id="system-badge">System Ready</span>
       </div>
     </div>
@@ -91,14 +91,14 @@
             <div class="toggle-container">
               <label class="toggle-option">
                 <input type="radio" name="init_mode_radio" value="vision" id="mode-vision" checked>
-                <span class="toggle-label">GLM-5.3-flash 视觉模型</span>
+                <span class="toggle-label">Gemini-3.1 视觉定位 (初筛测试)</span>
               </label>
               <label class="toggle-option">
                 <input type="radio" name="init_mode_radio" value="manual" id="mode-manual">
-                <span class="toggle-label">手动基线兜底 (Manual Fallback)</span>
+                <span class="toggle-label">人工校准基线 (Manual Calibration)</span>
               </label>
             </div>
-            <p class="mode-tip" id="mode-tip">优先调用 GLM 视觉接口一次性自动定位；若网关 403 则可切回手动兜底。</p>
+            <p class="mode-tip" id="mode-tip">优先调用视觉模型尝试定位招牌；若透视倾角存在偏差可切至人工校准基线。</p>
           </div>
 
           <div class="form-actions">
@@ -147,7 +147,7 @@
               <span class="metric-value" id="metric-inliers">-</span>
             </div>
             <div class="metric-item">
-              <span class="metric-label">重投影中位残差</span>
+              <span class="metric-label">匹配点拟合残差 (非边界误差)</span>
               <span class="metric-value" id="metric-reproj">-</span>
             </div>
             <div class="metric-item">
@@ -218,7 +218,7 @@
   <footer class="app-footer">
     <div class="footer-container">
       <span>FranchiseFlow · Hackathon Demo Prototype</span>
-      <span>Model: GLM-5.3-flash | CV: OpenCV SIFT & PyrLK</span>
+      <span>Model: gemini-3.1-flash-image | CV: OpenCV SIFT & PyrLK</span>
     </div>
   </footer>
 

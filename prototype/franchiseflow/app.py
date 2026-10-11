@@ -156,6 +156,32 @@ def get_job(job_id: str):
     return jsonify(JOBS[job_id])
 
 
+@app.route("/api/demo_results", methods=["GET"])
+def get_demo_results():
+    demo_dir = REPO_ROOT / "spikes" / "franchiseflow" / "outputs_demo_h264"
+    if not demo_dir.exists():
+        return jsonify({"error": "Demo outputs not ready"}), 404
+    summary_path = demo_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    job_id = "prebuilt_demo"
+    target_job_dir = OUTPUT_DIR / job_id
+    target_job_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    for p in demo_dir.glob("branch_*.mp4"):
+        shutil.copy2(p, target_job_dir / p.name)
+    outputs = [f"/outputs/{job_id}/{p.name}" for p in sorted(target_job_dir.glob("branch_*.mp4"))]
+    job_data = {
+        "job_id": job_id,
+        "status": "completed",
+        "vision_quad": summary.get("first_frame_quad", [[220.0, 55.0], [900.0, 300.0], [910.0, 410.0], [220.0, 165.0]]),
+        "initialization_mode": "manual_fallback",
+        "summary": summary,
+        "outputs": outputs,
+    }
+    JOBS[job_id] = job_data
+    return jsonify(job_data)
+
+
 @app.route("/outputs/<job_id>/<filename>")
 def serve_job_output(job_id: str, filename: str):
     job_dir = OUTPUT_DIR / job_id

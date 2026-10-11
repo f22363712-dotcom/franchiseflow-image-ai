@@ -9,12 +9,38 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
+
+
+def transcode_to_h264(input_path: Path, output_path: Path) -> Path:
+    """Transcode video to H.264 (yuv420p) with faststart for universal HTML5 browser playback."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("FFmpeg is required for browser-compatible H.264 video encoding but was not found in PATH.")
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-preset", "fast",
+        "-crf", "22",
+        "-an",
+        str(output_path),
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg transcode failed: {res.stderr}")
+    return output_path
+
 
 
 def read_quad(path: Path) -> np.ndarray:
@@ -196,6 +222,10 @@ def run_tracker(
         if not Path(sign_path).exists():
             raise ValueError(f"sign does not exist: {sign_path}")
 
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("FFmpeg is required for browser-compatible H.264 video encoding but was not found in PATH.")
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -211,10 +241,14 @@ def run_tracker(
     loaded_signs = [load_sign(Path(p)) for p in signs]
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     height, width = first.shape[:2]
-    paths = [out_dir / f"branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
+    target_paths = [out_dir / f"branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
+    raw_paths = [out_dir / f"_raw_branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
+    target_debug = out_dir / "tracking_debug.mp4"
+    raw_debug = out_dir / "_raw_tracking_debug.mp4"
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writers = [cv2.VideoWriter(str(p), fourcc, fps, (width, height)) for p in paths]
-    debug = None if no_debug else cv2.VideoWriter(str(out_dir / "tracking_debug.mp4"), fourcc, fps, (width, height))
+    writers = [cv2.VideoWriter(str(p), fourcc, fps, (width, height)) for p in raw_paths]
+    debug = None if no_debug else cv2.VideoWriter(str(raw_debug), fourcc, fps, (width, height))
     if not all(w.isOpened() for w in writers) or (debug is not None and not debug.isOpened()):
         cap.release()
         for w in writers:
@@ -276,6 +310,21 @@ def run_tracker(
         if debug is not None:
             debug.release()
 
+    # Transcode OpenCV mp4v outputs to web-compatible H.264 (yuv420p + faststart)
+    for raw_p, target_p in zip(raw_paths, target_paths):
+        transcode_to_h264(raw_p, target_p)
+        try:
+            raw_p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if debug is not None:
+        transcode_to_h264(raw_debug, target_debug)
+        try:
+            raw_debug.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     from metrics import compute_summary
 
     summary = compute_summary(
@@ -285,7 +334,7 @@ def run_tracker(
         elapsed_seconds=time.perf_counter() - t0,
         video_path=video_path,
         quad=quad_pts,
-        output_videos=paths,
+        output_videos=target_paths,
         mode=initialization_mode,
         extra={
             "opencv_version": cv2.__version__,
