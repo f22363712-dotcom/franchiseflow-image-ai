@@ -34,6 +34,50 @@
       <p class="hero-desc">视觉模型先给出每个场景的平面候选，本地 SIFT/RANSAC 跟踪后并行渲染分支视频。当前支持最多 8 个硬切场景、每场景最多 4 个非重叠平面；候选不确定时需要人工校准。</p>
     </section>
 
+    <!-- Batch production surface: one brand profile, several source videos. -->
+    <section class="card batch-section" id="batch-section">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">批量本地化生产</h3>
+          <span class="card-subtitle">选择已保存的品牌配置，一次提交多条门店视频</span>
+        </div>
+        <span class="badge badge-tech" id="batch-status-badge">等待提交</span>
+      </div>
+      <form id="batch-form" class="batch-form">
+        <div class="batch-controls">
+          <div class="form-group batch-profile-field">
+            <label class="form-label" for="batch-profile-select">
+              <span>品牌配置</span>
+              <span class="label-hint">必须选择已保存配置</span>
+            </label>
+            <select id="batch-profile-select" class="text-input" required>
+              <option value="">正在读取品牌配置…</option>
+            </select>
+            <p class="mode-tip" id="batch-profile-status">品牌配置会提供分店素材和识别策略。</p>
+          </div>
+          <div class="form-group batch-video-field">
+            <label class="form-label" for="batch-video-input">
+              <span>门店视频</span>
+              <span class="label-hint">最多 8 条，可多选</span>
+            </label>
+            <input id="batch-video-input" class="text-input batch-file-input" type="file" name="videos" accept=".mp4,.mov,.m4v,.webm,.avi,.mkv" multiple required>
+            <p class="mode-tip" id="batch-video-status">尚未选择视频。</p>
+          </div>
+        </div>
+        <div class="form-actions batch-actions">
+          <button type="submit" id="btn-submit-batch" class="btn btn-primary">
+            <span class="btn-text">提交批量任务</span>
+            <span class="btn-spinner" id="batch-btn-spinner" style="display:none;"></span>
+          </button>
+          <button type="button" id="btn-clear-batch" class="btn btn-secondary">清空批次</button>
+        </div>
+      </form>
+      <div id="batch-results" class="batch-results" hidden>
+        <div class="batch-summary" id="batch-summary"></div>
+        <div id="batch-jobs" class="batch-jobs" aria-live="polite"></div>
+      </div>
+    </section>
+
     <!-- Upload & Config Grid -->
     <div class="grid-layout">
       <!-- Left Panel: Input Controls -->

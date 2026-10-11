@@ -1276,6 +1276,7 @@ def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
             continue
         jobs.append({
             "job_id": job_id,
+            "video_file": job.get("video_file"),
             "status": job.get("status"),
             "phase": job.get("phase"),
             "branch_count": job.get("branch_count"),
@@ -1442,6 +1443,11 @@ def create_batch_endpoint():
     try:
         for video in videos:
             created_jobs.append(_create_job_from_request(video_file_override=video, batch_id_override=batch_id))
+            # Persist the child ID as soon as it exists. If the process stops
+            # while the remaining uploads are being validated, the durable
+            # batch index still points to the children already created.
+            batch["job_ids"].append(created_jobs[-1]["job_id"])
+            save_batch(BATCH_DIR, batch_id, batch)
     except (ValueError, RuntimeError) as exc:
         for job in created_jobs:
             job_id = job.get("job_id")

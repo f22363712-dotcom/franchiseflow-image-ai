@@ -195,6 +195,30 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn("btn-save-brand-profile", app_js)
         self.assertIn("saveCurrentBrandProfile", app_js)
 
+    def test_frontend_exposes_batch_production_controls(self):
+        html = (Path(__file__).resolve().parents[1] / "templates" / "index.html").read_text(encoding="utf-8")
+        app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        css = (Path(__file__).resolve().parents[1] / "static" / "app.css").read_text(encoding="utf-8")
+        for marker in (
+            "batch-form",
+            "batch-profile-select",
+            "batch-video-input",
+            "batch-results",
+            "batch-jobs",
+        ):
+            self.assertIn(marker, html)
+        for marker in (
+            "POST",
+            "/api/batches",
+            "pollBatch",
+            "/api/batches/${encodeURIComponent(batchId)}",
+            "打开人工复核",
+            "franchiseflow_batch_id",
+        ):
+            self.assertIn(marker, app_js)
+        for marker in ("batch-section", "batch-controls", "batch-job-card", "status-needs_review"):
+            self.assertIn(marker, css)
+
     def test_quality_review_can_accept_or_reject_rendered_batch(self):
         accepted_id = f"quality_accept_test_{uuid.uuid4().hex[:6]}"
         create_job(OUTPUT_DIR, accepted_id, {
@@ -361,6 +385,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(fetched.status_code, 200)
             fetched_payload = fetched.get_json()
             self.assertEqual(fetched_payload["status"], "queued")
+            self.assertEqual(fetched_payload["jobs"][0]["video_file"], "one.mp4")
             self.assertEqual([item["brand_profile_id"] for item in [self.client.get(f"/api/jobs/{job_id}").get_json() for job_id in payload["job_ids"]]], [profile_id, profile_id])
             listed = self.client.get("/api/batches?limit=5")
             self.assertEqual(listed.status_code, 200)

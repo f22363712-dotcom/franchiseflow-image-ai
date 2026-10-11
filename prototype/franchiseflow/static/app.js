@@ -43,6 +43,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const profileSaveSurfacePolicy = document.getElementById('profile-save-surface-policy');
   const profileSaveScenePolicy = document.getElementById('profile-save-scene-policy');
   const profileSaveStatus = document.getElementById('brand-profile-save-status');
+  const batchForm = document.getElementById('batch-form');
+  const batchProfileSelect = document.getElementById('batch-profile-select');
+  const batchProfileStatus = document.getElementById('batch-profile-status');
+  const batchVideoInput = document.getElementById('batch-video-input');
+  const batchVideoStatus = document.getElementById('batch-video-status');
+  const batchSubmitButton = document.getElementById('btn-submit-batch');
+  const batchSubmitSpinner = document.getElementById('batch-btn-spinner');
+  const batchSubmitText = batchSubmitButton?.querySelector('.btn-text');
+  const batchClearButton = document.getElementById('btn-clear-batch');
+  const batchStatusBadge = document.getElementById('batch-status-badge');
+  const batchResults = document.getElementById('batch-results');
+  const batchSummary = document.getElementById('batch-summary');
+  const batchJobs = document.getElementById('batch-jobs');
 
   let branchInputs = [];
   let activeJobId = null;
@@ -58,15 +71,56 @@ document.addEventListener('DOMContentLoaded', () => {
   const sceneSurfaces = new Map();
   let previewRenderToken = 0;
   let brandProfiles = new Map();
+  let activeBatchId = null;
+  let batchPollToken = 0;
+  let batchVideoNames = [];
+
+  const batchStatusLabels = {
+    queued: '排队中',
+    running: '处理中',
+    completed: '已完成',
+    needs_review: '需要复核',
+    partial_failed: '部分失败',
+    failed: '失败',
+    missing: '任务缺失',
+    vision_failed: '视觉定位失败',
+  };
+
+  function batchStatusLabel(status) {
+    return batchStatusLabels[String(status || '')] || String(status || '未知');
+  }
+
+  function setBatchStatus(text, className = 'badge badge-tech') {
+    if (!batchStatusBadge) return;
+    batchStatusBadge.textContent = text;
+    batchStatusBadge.className = className;
+  }
+
+  function renderBatchProfileOptions() {
+    if (!batchProfileSelect) return;
+    const current = batchProfileSelect.value;
+    batchProfileSelect.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = brandProfiles.size ? '选择品牌配置…' : '暂无可用品牌配置';
+    batchProfileSelect.appendChild(placeholder);
+    [...brandProfiles.values()].forEach(profile => {
+      const option = document.createElement('option');
+      option.value = String(profile.profile_id);
+      option.textContent = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).length} 个分店`;
+      batchProfileSelect.appendChild(option);
+    });
+    if (current && brandProfiles.has(current)) batchProfileSelect.value = current;
+  }
 
   function renderBrandProfileOptions() {
-    if (!brandProfileOptions) return;
-    brandProfileOptions.replaceChildren(...[...brandProfiles.values()].map(profile => {
+    if (brandProfileOptions) brandProfileOptions.replaceChildren(...[...brandProfiles.values()].map(profile => {
       const option = document.createElement('option');
       option.value = String(profile.profile_id);
       option.label = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).length} 个分店`;
       return option;
     }));
+    renderBatchProfileOptions();
   }
 
   async function loadBrandProfiles() {
@@ -78,8 +132,10 @@ document.addEventListener('DOMContentLoaded', () => {
       brandProfiles = new Map((payload.profiles || []).map(profile => [String(profile.profile_id), profile]));
       renderBrandProfileOptions();
       if (brandProfileStatus) brandProfileStatus.textContent = brandProfiles.size ? `已载入 ${brandProfiles.size} 个本地配置，可从列表选择。` : '暂无本地配置，可直接上传分支图片。';
+      if (batchProfileStatus) batchProfileStatus.textContent = brandProfiles.size ? `已载入 ${brandProfiles.size} 个品牌配置。` : '请先在单视频表单中保存一个品牌配置。';
     } catch (error) {
       if (brandProfileStatus) brandProfileStatus.textContent = '品牌配置列表暂时不可用，可继续直接上传分支图片。';
+      if (batchProfileStatus) batchProfileStatus.textContent = '品牌配置列表暂时不可用，批量提交需要稍后重试。';
     }
   }
 
@@ -210,6 +266,179 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   saveBrandProfileButton && saveBrandProfileButton.addEventListener('click', saveCurrentBrandProfile);
+
+  function updateBatchVideoStatus() {
+    if (!batchVideoStatus || !batchVideoInput) return;
+    const files = [...(batchVideoInput.files || [])];
+    batchVideoStatus.textContent = files.length
+      ? `已选择 ${files.length} 条视频：${files.map(file => file.name).join('、')}`
+      : '尚未选择视频。';
+  }
+
+  function updateBatchProfileStatus() {
+    if (!batchProfileStatus || !batchProfileSelect) return;
+    const profile = brandProfiles.get(batchProfileSelect.value);
+    batchProfileStatus.textContent = profile
+      ? `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).join('、') || '未设置分店标签'} · ${(profile.branch_assets || []).length || (profile.branch_files || []).length || 0} 个素材`
+      : (brandProfiles.size ? '品牌配置会提供分店素材和识别策略。' : '请先在单视频表单中保存一个品牌配置。');
+  }
+
+  function batchOutputLinks(job) {
+    const outputs = Array.isArray(job.outputs) ? job.outputs : [];
+    return outputs.map((url, index) => {
+      const link = document.createElement('a');
+      link.className = 'btn btn-outline';
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.download = `job_${job.job_id}_branch_${index + 1}.mp4`;
+      link.textContent = `下载成片 ${index + 1}`;
+      return link;
+    });
+  }
+
+  function openBatchJob(jobId) {
+    if (!jobId) return;
+    activeJobId = String(jobId);
+    localStorage.setItem('franchiseflow_job_id', activeJobId);
+    pollJob(activeJobId)
+      .then(() => {
+        document.getElementById('review-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (activeBatchId) {
+          batchPollToken += 1;
+          return pollBatch(activeBatchId, batchPollToken);
+        }
+        return null;
+      })
+      .catch(showError);
+  }
+
+  function renderBatch(batch) {
+    if (!batchResults || !batchJobs) return;
+    batchResults.hidden = false;
+    const counts = batch.counts || {};
+    const total = Number(counts.total || batch.requested_count || (batch.jobs || []).length || 0);
+    batchSummary.textContent = `批次 ${batch.batch_id || ''} · ${batchStatusLabel(batch.status)} · 已完成 ${counts.completed || 0}/${total} · 处理中 ${counts.running || 0} · 待复核 ${counts.needs_review || 0} · 失败 ${counts.failed || 0}`;
+    batchJobs.replaceChildren();
+    (Array.isArray(batch.jobs) ? batch.jobs : []).forEach((job, index) => {
+      const card = document.createElement('article');
+      card.className = 'batch-job-card';
+      const header = document.createElement('div');
+      header.className = 'batch-job-header';
+      const title = document.createElement('div');
+      title.className = 'batch-job-title';
+      title.textContent = job.video_file || batchVideoNames[index] || `视频 ${index + 1}`;
+      const badge = document.createElement('span');
+      badge.className = `batch-job-status status-${String(job.status || 'unknown')}`;
+      badge.textContent = batchStatusLabel(job.status);
+      header.append(title, badge);
+      card.appendChild(header);
+      const id = document.createElement('div');
+      id.className = 'batch-job-id';
+      id.textContent = job.job_id ? `任务 ${job.job_id}` : '任务 ID 不可用';
+      card.appendChild(id);
+      if (job.phase) {
+        const phase = document.createElement('div');
+        phase.className = 'mode-tip';
+        phase.textContent = `阶段：${job.phase}`;
+        card.appendChild(phase);
+      }
+      if (job.error) {
+        const error = document.createElement('p');
+        error.className = 'batch-job-error';
+        error.textContent = job.error;
+        card.appendChild(error);
+      }
+      const actions = document.createElement('div');
+      actions.className = 'batch-job-actions';
+      if (job.status === 'needs_review') {
+        const review = document.createElement('button');
+        review.type = 'button';
+        review.className = 'btn btn-secondary';
+        review.textContent = '打开人工复核';
+        review.addEventListener('click', () => openBatchJob(job.job_id));
+        actions.appendChild(review);
+      }
+      batchOutputLinks(job).forEach(link => actions.appendChild(link));
+      if (actions.children.length) card.appendChild(actions);
+      batchJobs.appendChild(card);
+    });
+  }
+
+  function batchIsTerminal(batch) {
+    const jobs = Array.isArray(batch.jobs) ? batch.jobs : [];
+    if (!jobs.length) return ['failed', 'completed', 'partial_failed'].includes(batch.status);
+    return jobs.every(job => ['completed', 'needs_review', 'failed', 'vision_failed', 'missing'].includes(job.status));
+  }
+
+  async function pollBatch(batchId, token = batchPollToken) {
+    const response = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
+    const batch = await response.json();
+    if (!response.ok) throw new Error(batch.error || '读取批量任务状态失败');
+    if (token !== batchPollToken) return batch;
+    activeBatchId = batchId;
+    renderBatch(batch);
+    setBatchStatus(batchStatusLabel(batch.status), batch.status === 'completed' ? 'badge badge-status' : 'badge badge-tech');
+    if (!batchIsTerminal(batch)) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000));
+      return pollBatch(batchId, token);
+    }
+    return batch;
+  }
+
+  function showBatchError(error) {
+    setBatchStatus('批量任务失败', 'badge');
+    if (batchResults) batchResults.hidden = false;
+    if (batchSummary) batchSummary.textContent = error.message || '批量任务状态读取失败。';
+  }
+
+  batchVideoInput && batchVideoInput.addEventListener('change', updateBatchVideoStatus);
+  batchProfileSelect && batchProfileSelect.addEventListener('change', updateBatchProfileStatus);
+  batchClearButton && batchClearButton.addEventListener('click', () => {
+    batchPollToken += 1;
+    activeBatchId = null;
+    batchVideoNames = [];
+    if (batchVideoInput) batchVideoInput.value = '';
+    updateBatchVideoStatus();
+    if (batchResults) batchResults.hidden = true;
+    if (batchJobs) batchJobs.replaceChildren();
+    if (batchSummary) batchSummary.textContent = '';
+    setBatchStatus('等待提交');
+    localStorage.removeItem('franchiseflow_batch_id');
+  });
+
+  batchForm && batchForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const profileId = batchProfileSelect?.value.trim() || '';
+    const files = [...(batchVideoInput?.files || [])];
+    if (!profileId) return showBatchError(new Error('请选择一个品牌配置。'));
+    if (!files.length) return showBatchError(new Error('请至少选择一条门店视频。'));
+    if (files.length > 8) return showBatchError(new Error('一次最多提交 8 条视频。'));
+    const payload = new FormData();
+    payload.append('brand_profile_id', profileId);
+    batchVideoNames = files.map(file => file.name);
+    files.forEach(file => payload.append('videos', file));
+    batchSubmitButton.disabled = true;
+    if (batchSubmitSpinner) batchSubmitSpinner.style.display = 'inline-block';
+    if (batchSubmitText) batchSubmitText.textContent = '正在提交批次…';
+    setBatchStatus('提交中');
+    try {
+      const response = await fetch('/api/batches', { method: 'POST', body: payload });
+      const batch = await response.json();
+      if (!response.ok) throw new Error(batch.error || `批量请求失败（HTTP ${response.status}）`);
+      activeBatchId = batch.batch_id;
+      batchPollToken += 1;
+      localStorage.setItem('franchiseflow_batch_id', activeBatchId);
+      renderBatch(batch);
+      await pollBatch(activeBatchId, batchPollToken);
+    } catch (error) {
+      showBatchError(error);
+    } finally {
+      batchSubmitButton.disabled = false;
+      if (batchSubmitSpinner) batchSubmitSpinner.style.display = 'none';
+      if (batchSubmitText) batchSubmitText.textContent = '提交批量任务';
+    }
+  });
 
   videoInput.addEventListener('change', () => {
     if (videoInput.files[0]) {
@@ -729,7 +958,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   const savedJobId = localStorage.getItem('franchiseflow_job_id');
-  if (savedJobId) {
+  const savedBatchId = localStorage.getItem('franchiseflow_batch_id');
+  if (savedBatchId && !savedJobId) {
+    activeBatchId = savedBatchId;
+    batchPollToken += 1;
+    pollBatch(savedBatchId, batchPollToken).catch(showBatchError);
+  } else if (savedJobId) {
     pollJob(savedJobId).catch(showError);
   } else {
     // A browser refresh can lose localStorage while the durable job JSON still
