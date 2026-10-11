@@ -1,76 +1,64 @@
 # FranchiseFlow
 
-**One Moving Storefront Video → Three Brand Branch Videos via Planar Vision AI & Geometric Tracking**
+**一条移动门店视频，生成 1 到 10 条分店本地化成片。**
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![OpenCV](https://img.shields.io/badge/OpenCV-5.x-5C3EE8.svg)](https://opencv.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+FranchiseFlow 面向连锁品牌的视频本地化制作。用户上传一条连续门店运镜视频和若干分店招牌图片，系统先让视觉模型提出平面候选，再用三帧检查判断候选能否交给本地几何跟踪器。候选不可靠时，页面展示原因并允许拖动四个角点确认。
 
-FranchiseFlow solves a core content bottleneck for franchise retail and multi-branch brands: turning a single moving storefront video clip into multiple location-specific branch variants.
+第一版支持单条连续镜头、一个主要平面招牌、720p、15 秒以内和 1 到 10 个分支。多场景切分、前景遮挡抠像和 3D 网格不在当前范围内。
 
-Instead of expensive and jittery frame-by-frame multimodal API calls, FranchiseFlow implements an intelligent hybrid pipeline:
-1. **Physical Plane Localization (Vision AI / Calibration)**: The first frame is passed to **gemini-3.1-flash-image** for initial plane discovery, paired with an explicit **Manual Calibration Baseline** (`quad.json`) when 3D perspective angles require ground-truth alignment.
-2. **Sub-pixel Geometric Tracking (Local CV)**: OpenCV SIFT feature matching with RANSAC homography estimation tracks the moving sign through camera motion, backed by Lucas-Kanade (LK) optical flow.
-3. **Multi-Branch Synchronous Compositing**: Exactly three branch brand assets are perspective-warped and composited onto the original video simultaneously, generating three web-compatible H.264 MP4 files.
+## Pipeline
 
----
-
-## 🎯 Architecture
-
-```
-[Moving Storefront MP4] (Frame 0)
-        │
-        ▼
-[gemini-3.1-flash-image / Calibration] ──► [Planar Quad (TL, TR, BR, BL)]
-        │                                  │
-        └─────────────────┬────────────────┘
-                          ▼
-             [OpenCV Planar Tracker]
-         (SIFT Anchor Matching + RANSAC)
-               (LK Flow Fallback)
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-    [Branch 1 MP4]  [Branch 2 MP4]  [Branch 3 MP4]
-    (Riverside St)   (Downtown Ave)   (Northpark Mall)
+```text
+[门店 MP4 + 1..10 张分店招牌]
+                 │
+                 ▼
+     [三帧采样 + 视觉候选定位]
+                 │
+        ┌────────┴────────┐
+        ▼                 ▼
+ [候选通过验证]       [候选需要确认]
+        │                 │
+        ▼                 ▼
+ [SIFT/RANSAC/LK]   [拖动四角后继续]
+        └────────┬────────┘
+                 ▼
+ [每个分支一条 H.264 MP4，输入有音频时保留音轨]
 ```
 
----
+视觉模型只负责提出候选平面。每帧跟踪由本地 OpenCV 完成，模型不会被逐帧调用。RANSAC 内点拟合失败的帧写入 `tracking.jsonl`，该帧输出原画。
 
-## 🚀 Quickstart
+## Quickstart
 
-### 1. Requirements
-
-- Python 3.11+
-- Dependencies: `opencv-python`, `numpy`, `pillow`, `flask`
+需要 Python 3.11+、FFmpeg（包含 `ffmpeg` 和 `ffprobe`）以及 OpenCV、NumPy、Pillow、Flask。
 
 ```bash
-pip install opencv-python numpy pillow flask
-```
-
-### 2. Run the Web Demo UI
-
-Start the local demo interface:
-
-```bash
+python -m pip install -r requirements.txt
 python prototype/franchiseflow/app.py
 ```
 
-Open `http://127.0.0.1:5000/` in your browser:
-- Upload any moving storefront clip (or use `spikes/franchiseflow/fixtures/real_storefront.mp4`).
-- Upload three branch sign images (or use the sample branch assets in `spikes/franchiseflow/assets/`).
-- Toggle between **gemini-3.1-flash-image 视觉定位 (初筛测试)** and **人工校准基线 (Manual Calibration)**.
-- Click **载入默认样例素材** to instantly review the verified H.264 outputs and telemetry metrics.
+打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；候选需要人工确认时，提交四角到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口。
 
-### 3. Generate Demo Cut & Run CLI Pipeline
+### API key
 
-Generate the clean 6.0-second (144-frame) demo cut from the storefront video:
+复制 `.env.example` 为 `.env`，只在本地填写：
+
+```bash
+BANANA_API_KEY=...
+BANANA_API_BASE_URL=https://keungliang.dpdns.org/v1
+BANANA_VISION_MODEL=gemini-3.1-flash-image
+```
+
+`.env` 被 Git 忽略。日志、任务 JSON、预览图和提交历史不会写入密钥。
+
+### Reproduce the tracked sample
+
+`demo_cut.mp4` 是由公开素材生成的本地文件，默认不提交到 Git。需要时运行：
 
 ```bash
 ffmpeg -y -i spikes/franchiseflow/fixtures/real_storefront.mp4 -t 6.0 -c copy spikes/franchiseflow/fixtures/demo_cut.mp4
 ```
 
-Run the deterministic tracking and H.264 transcode pipeline via CLI:
+使用人工校准基线运行本地跟踪：
 
 ```bash
 python spikes/franchiseflow/tracker.py \
@@ -80,85 +68,35 @@ python spikes/franchiseflow/tracker.py \
   --out-dir spikes/franchiseflow/outputs_demo_h264
 ```
 
-Outputs are written to `outputs_demo_h264/`:
-- `branch_1_riverside.mp4` (H.264, yuv420p, faststart, browser-playable)
-- `branch_2_downtown.mp4` (H.264, yuv420p, faststart, browser-playable)
-- `branch_3_northpark.mp4` (H.264, yuv420p, faststart, browser-playable)
-- `tracking.jsonl` (per-frame telemetry)
-- `summary.json` (reprojection residuals, inlier counts, processing time)
+`--quad-json` 明确表示人工基线。若要标记为模型或人工复核结果，可传 `--initialization-mode vision_model` 或 `--initialization-mode reviewed_candidate`，不能用参数名推断来源。
 
----
+## 实测边界
 
-## 🤖 Vision Model Configuration & Positioning
+- 0.30 到 0.36 px 是 RANSAC 单应矩阵的 SIFT 内点重投影拟合残差，不是招牌物理边缘的真实定位误差。
+- 20 帧短测记录过 475 个首帧特征、288 个中位内点和 0.30 px 残差；这些数字不能代表整段视频。
+- 6 秒、144 帧的人工基线样例曾用约 122 秒完成，其中纯跟踪约 63 秒；具体耗时取决于机器和 FFmpeg。
+- 回退只处理已经检测到的跟踪失败，当前没有 SAM 或视频抠像，行人经过招牌时可能被替换画面覆盖。
+- 输入有音频时，FFmpeg 使用原视频音轨合成输出；无音频输入不会添加静音轨。
+- 当前服务在本地线程中处理任务，任务状态保存为每个任务目录下的 JSON；生产部署还需要队列、权限和清理策略。
 
-Copy `.env.example` to `.env` and set your credentials:
-
-```bash
-cp .env.example .env
-```
-
-Configuration variables (read strictly from environment or `.env`):
-- `BANANA_API_KEY`: API key (never hardcoded or committed)
-- `BANANA_API_BASE_URL`: Gateway URL (defaults to `https://keungliang.dpdns.org/v1`)
-- `BANANA_VISION_MODEL`: Model identifier (defaults to `gemini-3.1-flash-image`)
-
-Test first-frame sign localization:
+## Tests
 
 ```bash
-python spikes/franchiseflow/auto_quad.py \
-  --image spikes/franchiseflow/fixtures/real_storefront_first.jpg \
-  --out-json spikes/franchiseflow/quad_auto.json \
-  --preview spikes/franchiseflow/quad_auto_preview.jpg \
-  --target-hint "Dark gray storefront signage board displaying 'STATE OF CONFUSION'"
-```
-
-> **Engineering Note on Localization**: In evaluations with `gemini-3.1-flash-image`, current multimodal vision models lack fine-grained 3D perspective orientation on oblique commercial facades and frequently predict quadrilaterals cutting across brick walls and windows. FranchiseFlow explicitly transparentizes this limitation: the model provides initial candidate screening, while the **Manual Calibration Baseline** (`quad.json`) provides verified geometric corners. Passing `--quad-json` does NOT imply automated model discovery.
-
----
-
-## 🧪 Testing & Verification
-
-Run the entire test suite (22 tests covering HTTP contracts, error redaction, synthetic motion, FFmpeg missing checks, and Web API streaming):
-
-```bash
-# Tracker & Vision Client tests
 python -m unittest discover -s spikes/franchiseflow/tests -v
-
-# Prototype Web API tests
 python -m unittest discover -s prototype/franchiseflow/tests -v
-
-# Code cleanliness & secret leak scan
 git diff --check
 git grep -n -I -E 'sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}' -- ':!D*'
 ```
 
----
+测试覆盖模型错误脱敏、候选四边形校验、三帧验证、SIFT/LK 失败帧、FFmpeg 缺失、音频参数、1 到 10 个分支、任务持久化、人工复核和 Range 播放接口。
 
-## 📊 Measured Performance & Metrics
+## Known limitations
 
-- **Residual Definition**: Reported reprojection residuals (e.g. 0.30 px – 0.36 px) are **internal SIFT inlier fit residuals** from RANSAC homography estimation, **not ground-truth sign boundary errors**.
-- **Short-test Metrics (20 frames)**: 475 SIFT features extracted in frame 0, median 288 inliers, 0 failed frames, median reprojection residual 0.30 px.
-- **Full Demo Cut (144 frames, 6.0s, 24 fps)**:
-  - Initialization: Manual calibration baseline (`quad.json`)
-  - Total processing time: 122s (including H.264 libx264 yuv420p faststart transcoding; pure tracking ~63s)
-  - First-frame SIFT features: 286
-  - Median inliers: 113 consensus points
-  - Median reprojection residual: 0.362 px (P95: 1.86 px)
-  - Failed frames: 0 (143/143 tracked via anchor SIFT)
-- **Scope & Physical Boundaries**:
-  - The fallback policy only handles *detected tracking failures* (e.g. low inlier counts or degenerate homographies) by preserving original frames.
-  - The system currently has **no foreground occlusion segmentation** (e.g. SAM or video matting) and does **not preserve original audio**.
+真实样例中，`gemini-3.1-flash-image` 可能把倾斜立面的砖墙、窗户或门洞混入四边形。系统会把这种候选交给三帧验证和人工确认，不把人工 `quad.json` 冒充模型定位结果。视觉模型的默认提示词包含样例招牌文字 `STATE OF CONFUSION`，但没有写入样例像素坐标。
 
----
+## Credits
 
-## 🏆 Banana Hacks Submission Checklist
-
-- [x] **Project Name**: FranchiseFlow
-- [x] **Public GitHub Repository**: [franchiseflow-image-ai](https://github.com/f22363712-dotcom/franchiseflow-image-ai)
-- [x] **Demo Video Script**: Under 3 minutes (see [docs/FranchiseFlow_Demo脚本.md](docs/FranchiseFlow_Demo脚本.md))
-- [x] **Strict Secret Hygiene**: Zero hardcoded keys or leaked secrets
-- [x] **Hackathon Window Creation**: Developed during the official hackathon window
-- [x] **Credits & Third-Party Resources**:
-  - Storefront video fixture from Pexels (License record in `spikes/franchiseflow/fixtures/source.md`)
-  - Vision Model: `gemini-3.1-flash-image` (via authorized endpoint)
-  - Core Libraries: OpenCV, NumPy, Pillow, Flask, FFmpeg
+- Storefront video: Pexels, license record in `spikes/franchiseflow/fixtures/source.md`
+- Vision model: `gemini-3.1-flash-image` through the configured OpenAI-compatible gateway
+- Core libraries: OpenCV, NumPy, Pillow, Flask, FFmpeg
+- License: MIT

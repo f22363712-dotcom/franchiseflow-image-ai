@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tracker import PlanarTracker, composite, project_quad, run_tracker
+from tracker import PlanarTracker, composite, main, project_quad, run_tracker
 
 
 def _create_textured_image(width=640, height=480):
@@ -149,6 +149,13 @@ class TrackerSyntheticTests(unittest.TestCase):
         five = run_tracker(video_path, quad, signs + extra, self.temp_dir / "five", no_debug=True)
         self.assertEqual(five["branch_count"], 5)
         self.assertEqual(len(five["output_videos"]), 5)
+
+    @patch("tracker.run_tracker", return_value={"branch_count": 1})
+    def test_cli_accepts_one_sign_asset(self, run_mock):
+        with patch("sys.argv", ["tracker.py", "--video", "video.mp4", "--quad-json", "quad.json", "--signs", "one.png", "--out-dir", "out"]):
+            with patch("builtins.print"):
+                main()
+        self.assertEqual(run_mock.call_args.kwargs["signs"], [Path("one.png")])
 
 
     @patch("shutil.which", return_value=None)

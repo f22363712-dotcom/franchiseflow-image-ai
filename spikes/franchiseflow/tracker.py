@@ -384,7 +384,7 @@ def main():
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--quad", type=Path, help="manual TL TR BR BL pixel coordinates")
     parser.add_argument("--quad-json", type=Path, help="JSON file containing quad corners")
-    parser.add_argument("--signs", type=Path, nargs=3, required=True, metavar="PNG")
+    parser.add_argument("--signs", type=Path, nargs="+", required=True, metavar="PNG")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--min-inliers", type=int, default=8)
