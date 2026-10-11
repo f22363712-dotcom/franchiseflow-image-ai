@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
 from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR
+from job_store import load_job, save_job
 
 
 def _make_dummy_mp4():
@@ -66,13 +67,11 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn("error", res.get_json())
 
-    def test_fewer_than_three_branches_returns_400(self):
+    def test_empty_branches_returns_400(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),
-            "branch_1": (_make_dummy_image("b1"), "b1.png"),
-            "branch_2": (_make_dummy_image("b2"), "b2.png"),
         }
-        res = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        res = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
         self.assertEqual(res.status_code, 400)
         self.assertIn("error", res.get_json())
 
@@ -102,7 +101,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
             json_data = res.get_json()
             self.assertIn("error", json_data)
             self.assertIn("HTTP 403", json_data["error"])
-            self.assertEqual(len(JOBS), 0)
+            self.assertEqual(len(JOBS), 1)
+            self.assertEqual(next(iter(JOBS.values()))["status"], "failed")
 
     def test_successful_render_with_mocked_pipeline(self):
         data = {
@@ -124,7 +124,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
 
         with patch("app.VisionClient", return_value=mock_instance):
             with patch("app.run_tracker", return_value=mock_summary):
-                res = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+                with patch("app.validate_candidate", return_value={"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}):
+                    res = self.client.post("/api/render", data=data, content_type="multipart/form-data")
                 self.assertEqual(res.status_code, 200)
                 json_data = res.get_json()
                 self.assertEqual(json_data["status"], "completed")
@@ -144,6 +145,61 @@ class FranchiseFlowAppTests(unittest.TestCase):
             data = res.get_json()
             self.assertEqual(data["status"], "completed")
             self.assertEqual(len(data["outputs"]), 3)
+
+    def test_create_job_accepts_one_branch_and_returns_202(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job") as submit:
+            res = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(res.status_code, 202)
+        payload = res.get_json()
+        self.assertEqual(payload["status"], "queued")
+        submit.assert_called_once_with(payload["job_id"])
+        get_res = self.client.get(f"/api/jobs/{payload['job_id']}")
+        self.assertEqual(get_res.status_code, 200)
+        self.assertEqual(get_res.get_json()["branch_count"], 1)
+
+    def test_create_job_rejects_more_than_ten_branches(self):
+        data = {"video": (_make_dummy_mp4(), "video.mp4")}
+        for index in range(11):
+            data.setdefault("branches", []).append((_make_dummy_image(f"b{index}"), f"b{index}.png"))
+        res = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("1 to 10", res.get_json()["error"])
+
+    def test_review_endpoint_only_accepts_needs_review_job(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "needs_review", "candidate": {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]]}})
+        save_job(OUTPUT_DIR, job_id, job)
+        with patch("app._submit_job") as submit:
+            res = self.client.post(f"/api/jobs/{job_id}/review", json={"quad": [[20, 20], [100, 20], [100, 80], [20, 80]]})
+        self.assertEqual(res.status_code, 202)
+        self.assertEqual(res.get_json()["initialization_mode"], "reviewed_candidate")
+        submit.assert_called_once_with(job_id)
+
+    def test_outputs_endpoint_returns_branch_urls(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png"), (_make_dummy_image("b2"), "b2.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "completed", "outputs": [f"/outputs/{job_id}/branch_1.mp4", f"/outputs/{job_id}/branch_2.mp4"]})
+        save_job(OUTPUT_DIR, job_id, job)
+        res = self.client.get(f"/api/jobs/{job_id}/outputs")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.get_json()["outputs"]), 2)
 
 
 if __name__ == "__main__":
