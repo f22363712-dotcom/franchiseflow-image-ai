@@ -331,6 +331,42 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual([item["start_frame"] for item in call["scene_plan"]], [0, 2])
         self.assertEqual(scene_sampler.call_args.kwargs["max_scenes"], 8)
 
+    def test_manual_scene_quads_validate_and_reach_tracker_per_scene(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+            "use_manual_quad": "true",
+            "manual_quad": json.dumps([[20, 20], [100, 20], [100, 80], [20, 80]]),
+            "manual_scene_quads": json.dumps([
+                [[20, 20], [100, 20], [100, 80], [20, 80]],
+                [[140, 30], [220, 30], [220, 90], [140, 90]],
+            ]),
+        }
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        summary = {"frames": 4, "fps": 10.0, "failed_frames": [], "output_videos": []}
+        with patch("app.validate_candidate", return_value=accepted), patch("app.run_tracker", return_value=summary) as tracker:
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["initialization_mode"], "manual_fallback")
+        plan = tracker.call_args.kwargs["scene_plan"]
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[0]["surfaces"][0]["quad"][0], [20.0, 20.0])
+        self.assertEqual(plan[1]["surfaces"][0]["quad"][0], [140.0, 30.0])
+        self.assertEqual(payload["summary"]["scene_count"], 2)
+
+    def test_manual_scene_quad_count_must_match_detected_scenes(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+            "use_manual_quad": "true",
+            "manual_quad": json.dumps([[20, 20], [100, 20], [100, 80], [20, 80]]),
+            "manual_scene_quads": json.dumps([[[20, 20], [100, 20], [100, 80], [20, 80]]]),
+        }
+        response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("manual_scene_quads", response.get_json()["error"])
+
     def test_target_hint_is_persisted_and_forwarded_to_vision_client(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),

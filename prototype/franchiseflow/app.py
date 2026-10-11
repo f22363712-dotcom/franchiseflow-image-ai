@@ -112,6 +112,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "candidate": job.get("candidate"),
         "candidates": job.get("candidates", []),
         "asset_bindings": job.get("asset_bindings"),
+        "manual_scene_quads": job.get("manual_scene_quads"),
         "reviewed_quad": job.get("reviewed_quad"),
         "vision_audit": job.get("vision_audit"),
         "scenes": job.get("scenes", []),
@@ -289,6 +290,22 @@ def _branch_labels(raw_value: str | None, branch_files: list[Any]) -> list[str]:
         raise ValueError(f"Invalid branch_labels: {exc}") from exc
 
 
+def _parse_manual_scene_quads(raw_value: str | None) -> list[list[list[float]]] | None:
+    """Parse optional per-scene operator calibration in detected-scene order."""
+    if not raw_value:
+        return None
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid manual_scene_quads JSON: {exc}") from exc
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("manual_scene_quads must be a non-empty JSON array")
+    try:
+        return [parse_quad(item).round(3).tolist() for item in payload]
+    except (TypeError, ValueError, cv2.error) as exc:
+        raise ValueError(f"Invalid manual_scene_quads: {exc}") from exc
+
+
 def _create_job_from_request() -> dict[str, Any]:
     video_file = request.files.get("video")
     if video_file is None or not video_file.filename:
@@ -359,7 +376,8 @@ def _create_job_from_request() -> dict[str, Any]:
             if decoded.shape[0] * decoded.shape[1] > MAX_IMAGE_PIXELS:
                 raise ValueError(f"branch image {path.name} exceeds the {MAX_IMAGE_PIXELS} pixel limit")
 
-        manual = request.form.get("use_manual_quad", "false").lower() in {"true", "1", "yes"}
+        raw_manual_scene_quads = request.form.get("manual_scene_quads")
+        manual = request.form.get("use_manual_quad", "false").lower() in {"true", "1", "yes"} or bool(raw_manual_scene_quads)
         raw_asset_bindings = request.form.get("asset_bindings")
         asset_bindings = None
         if raw_asset_bindings:
@@ -370,6 +388,7 @@ def _create_job_from_request() -> dict[str, Any]:
             if not isinstance(asset_bindings, list):
                 raise ValueError("asset_bindings must be a JSON array")
         manual_quad = None
+        manual_scene_quads = _parse_manual_scene_quads(raw_manual_scene_quads)
         if manual:
             raw_quad = request.form.get("manual_quad")
             if raw_quad:
@@ -387,6 +406,12 @@ def _create_job_from_request() -> dict[str, Any]:
             if (np.any(manual_points[:, 0] < 0) or np.any(manual_points[:, 0] >= frame_width) or
                     np.any(manual_points[:, 1] < 0) or np.any(manual_points[:, 1] >= frame_height)):
                 raise ValueError("manual quad lies outside uploaded video frame")
+            if manual_scene_quads:
+                for index, scene_quad in enumerate(manual_scene_quads, start=1):
+                    scene_points = np.asarray(scene_quad, dtype=np.float32)
+                    if (np.any(scene_points[:, 0] < 0) or np.any(scene_points[:, 0] >= frame_width) or
+                            np.any(scene_points[:, 1] < 0) or np.any(scene_points[:, 1] >= frame_height)):
+                        raise ValueError(f"manual scene quad {index} lies outside uploaded video frame")
     except ValueError:
         shutil.rmtree(upload_dir, ignore_errors=True)
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -403,6 +428,7 @@ def _create_job_from_request() -> dict[str, Any]:
         "branch_count": len(branch_names),
         "initialization_mode": "manual_fallback" if manual else "vision_model",
         "manual_quad": manual_quad,
+        "manual_scene_quads": manual_scene_quads,
         "asset_bindings": asset_bindings,
         "target_hint": request.form.get("target_hint") or None,
         "output_urls": [],
@@ -668,6 +694,29 @@ def _scene_view(
     return result
 
 
+def _manual_candidate(quad: list | np.ndarray) -> dict[str, Any]:
+    """Represent an operator calibration without implying model provenance."""
+    return {
+        "quad": parse_quad(quad).round(3).tolist(),
+        "confidence": 1.0,
+        "reason": "operator_calibrated",
+    }
+
+
+def _validate_manual_candidate(scene: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Run the same multi-frame safety checks for an offline calibration."""
+    try:
+        validation = validate_candidate(scene["samples"], candidate)
+    except (TypeError, ValueError, cv2.error) as exc:
+        validation = {
+            "accepted": False,
+            "requires_human_review": True,
+            "reasons": [f"manual candidate validation failed: {exc}"],
+            "sample_metrics": [],
+        }
+    return {**validation, "source": "manual_fallback"}
+
+
 def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: Path, target_hint: str | None, job_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, dict[str, Any]]:
     """Locate up to four non-overlapping planar surfaces per scene."""
     views: list[dict[str, Any]] = []
@@ -795,21 +844,65 @@ def _process_job(job_id: str) -> None:
         if manual_quad is not None and not (job.get("scene_plan") and job.get("initialization_mode") == "reviewed_candidate"):
             quad = parse_quad(manual_quad)
             mode = job.get("initialization_mode", "manual_fallback")
-            if len(detected_scenes) > 1:
-                raise ValueError("manual fallback currently supports one hard-cut scene; use vision review for multi-scene video")
-            for scene in detected_scenes:
+            manual_scene_quads = job.get("manual_scene_quads")
+            if manual_scene_quads is not None and len(manual_scene_quads) != len(detected_scenes):
+                raise ValueError(
+                    f"manual_scene_quads has {len(manual_scene_quads)} items, but video contains {len(detected_scenes)} scenes"
+                )
+            manual_candidates: list[dict[str, Any]] = []
+            manual_validations: list[dict[str, Any]] = []
+            for scene_index, scene in enumerate(detected_scenes):
+                scene_quad = manual_scene_quads[scene_index] if manual_scene_quads else manual_quad
+                scene_candidate = _manual_candidate(scene_quad)
+                scene_validation = _validate_manual_candidate(scene, scene_candidate)
+                manual_candidates.append(scene_candidate)
+                manual_validations.append(scene_validation)
                 scene_dir = sample_dir / scene["scene_id"]
                 _save_contact_sheet(scene["samples"], scene_dir)
                 scene_views.append(_scene_view(
                     scene,
                     f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg",
-                    candidate if len(detected_scenes) == 1 else None,
-                    validation,
-                    status="validated",
+                    scene_candidate,
+                    scene_validation,
+                    status="validated" if scene_validation.get("accepted") else "needs_review",
                     mode=mode,
+                    candidates=[scene_candidate],
+                    validations=[scene_validation],
                 ))
-                scene_plan = scene_plan or []
-                scene_plan.append(_scene_plan_entry(scene, quad, mode=mode))
+                if scene_validation.get("accepted"):
+                    scene_plan = scene_plan or []
+                    scene_plan.append(_scene_plan_entry(scene, scene_candidate["quad"], mode=mode))
+            if any(not item.get("accepted") for item in manual_validations):
+                first_failed = next(item for item in manual_validations if not item.get("accepted"))
+                job.update({
+                    "status": "needs_review",
+                    "phase": "human_review",
+                    "scenes": scene_views,
+                    "scene_plan": [],
+                    "candidate": manual_candidates[0] if manual_candidates else None,
+                    "candidates": manual_candidates,
+                    "validation": first_failed,
+                    "validations": manual_validations,
+                    "error": "one or more manual scene calibrations require human review",
+                    "sample_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/first.jpg",
+                    "contact_sheet_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/contact_sheet.jpg",
+                })
+                _set_job(job)
+                return
+            candidate = manual_candidates[0] if manual_candidates else None
+            validation = manual_validations[0] if manual_validations else None
+            if len(detected_scenes) == 1:
+                quad = parse_quad(candidate["quad"])
+            else:
+                # The tracker consumes the first scene's quad for its legacy
+                # argument and uses the scene manifest for every later shot.
+                quad = parse_quad(manual_candidates[0]["quad"])
+            job.update({
+                "candidate": candidate,
+                "candidates": manual_candidates,
+                "validation": validation,
+                "validations": manual_validations,
+            })
             if len(detected_scenes) == 1:
                 _save_contact_sheet(samples, sample_dir)
         elif job.get("scene_plan") and job.get("initialization_mode") == "reviewed_candidate":
@@ -940,7 +1033,8 @@ def _process_job(job_id: str) -> None:
     except Exception as exc:
         message = str(exc)
         vision_error = message.startswith("vision_failed") or "vision gateway" in message.lower() or "candidate response" in message.lower()
-        job.update({"status": "vision_failed" if vision_error else "failed", "phase": "vision_failed" if vision_error else "failed", "error": message})
+        input_error = message.startswith("manual_scene_quads") or message.startswith("manual scene quad")
+        job.update({"status": "vision_failed" if vision_error else "failed", "phase": "vision_failed" if vision_error else "failed", "error": message, "input_error": input_error})
     _set_job(job)
 
 
@@ -1175,7 +1269,7 @@ def render_job():
     finally:
         _release_sync_slot()
     if job.get("status") != "completed":
-        code = 502 if "HTTP 401" in job.get("error", "") or "HTTP 403" in job.get("error", "") else 500
+        code = 400 if job.get("input_error") else (502 if "HTTP 401" in job.get("error", "") or "HTTP 403" in job.get("error", "") else 500)
         return jsonify({
             "error": job.get("error", "render failed"),
             "status": job.get("status"),

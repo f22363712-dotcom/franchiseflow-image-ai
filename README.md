@@ -82,6 +82,7 @@ python spikes/franchiseflow/tracker.py \
 - 输入有音频时，FFmpeg 使用原视频音轨合成输出；无音频输入不会添加静音轨。
 - 当前服务在本地线程中处理任务，任务状态保存为每个任务目录下的 JSON；生产部署还需要队列、权限和清理策略。
 - 场景检测采用保守的硬切和短窗口 dissolve 判断；低置信度复杂转场可能被合并到同一场景并进入复核。
+- 断网时可以向 `POST /api/jobs` 提交 `use_manual_quad=true` 和可选的 `manual_scene_quads` JSON 数组。数组按检测出的场景顺序提供四角，系统逐场景运行多帧纹理与单应性验证。数组长度不匹配或任一场景验证失败会停在 `needs_review`，不会把首个镜头的坐标复制到整段视频。
 
 ## Scene / Surface 实验接口
 
