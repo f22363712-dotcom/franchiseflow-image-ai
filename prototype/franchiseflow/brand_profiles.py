@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -81,6 +82,7 @@ def create_profile(
         raise ValueError(f"brand profile already exists: {profile_id}")
     directory.mkdir(parents=True, exist_ok=False)
     branch_files: list[str] = []
+    branch_assets: list[dict[str, Any]] = []
     try:
         for index, source in enumerate(sources, start=1):
             if not source.is_file():
@@ -89,14 +91,22 @@ def create_profile(
             if suffix not in {".png", ".jpg", ".jpeg"}:
                 raise ValueError(f"brand profile asset has unsupported extension: {suffix}")
             filename = f"branch_{index}{suffix}"
-            shutil.copyfile(source, directory / filename)
+            destination = directory / filename
+            shutil.copyfile(source, destination)
             branch_files.append(filename)
+            digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+            branch_assets.append({
+                "filename": filename,
+                "sha256": digest,
+                "bytes": destination.stat().st_size,
+            })
         profile = {
             "profile_id": profile_id,
             "brand_name": brand_name,
             "target_hint": target_hint,
             "branch_labels": list(branch_labels),
             "branch_files": branch_files,
+            "branch_assets": branch_assets,
             "default_fit": default_fit,
             "surface_policy": surface_policy,
             "created_at": datetime.now(timezone.utc).isoformat(),

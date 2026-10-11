@@ -267,6 +267,9 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(profile["profile_id"], profile_id)
             self.assertEqual(profile["branch_labels"], ["滨河路店", "市中心店"])
             self.assertEqual(len(profile["branch_files"]), 2)
+            self.assertEqual(len(profile["branch_assets"]), 2)
+            self.assertTrue(all(len(item["sha256"]) == 64 for item in profile["branch_assets"]))
+            self.assertTrue(all(item["bytes"] > 0 for item in profile["branch_assets"]))
             listed = self.client.get("/api/brand-profiles").get_json()["profiles"]
             self.assertTrue(any(item["profile_id"] == profile_id for item in listed))
             fetched = self.client.get(f"/api/brand-profiles/{profile_id}")
@@ -294,6 +297,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(job["brand_profile_id"], profile_id)
             self.assertEqual(job["branch_labels"], ["A_店", "B_店"])
             self.assertEqual(job["branch_count"], 2)
+            self.assertEqual(len(job["brand_profile_assets"]), 2)
+            self.assertTrue(all(len(item["sha256"]) == 64 for item in job["brand_profile_assets"]))
             self.assertTrue((UPLOAD_DIR / job["job_id"] / "branch_1.png").exists())
             submit.assert_called_once_with(job["job_id"])
         finally:

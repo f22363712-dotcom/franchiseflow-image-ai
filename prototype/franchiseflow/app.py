@@ -114,6 +114,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "brand_profile_id": job.get("brand_profile_id"),
         "brand_profile_default_fit": job.get("brand_profile_default_fit"),
         "brand_profile_surface_policy": job.get("brand_profile_surface_policy"),
+        "brand_profile_assets": job.get("brand_profile_assets", []),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
         "target_hint": job.get("target_hint"),
@@ -466,6 +467,7 @@ def _create_job_from_request() -> dict[str, Any]:
         "brand_profile_id": brand_profile_id,
         "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
         "brand_profile_surface_policy": brand_profile.get("surface_policy") if brand_profile else None,
+        "brand_profile_assets": brand_profile.get("branch_assets", []) if brand_profile else [],
         "output_urls": [],
     })
     JOBS[job_id] = job

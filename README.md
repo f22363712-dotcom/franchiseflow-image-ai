@@ -103,7 +103,7 @@ curl -X POST http://127.0.0.1:5000/api/brand-profiles \
   -F 'branches=@assets/downtown.png'
 ```
 
-创建任务时只上传视频并传 `brand_profile_id=north-star`，系统会复制配置中的图片到任务目录，并沿用标签和 `target_hint`。一次任务可以继续直接上传 `branches`，两种方式不能混用，避免分店顺序产生歧义。配置目录默认在 `prototype/franchiseflow/brand_profiles/`，已加入 Git 忽略规则。
+创建任务时只上传视频并传 `brand_profile_id=north-star`，系统会复制配置中的图片到任务目录，并沿用标签和 `target_hint`。配置和任务清单会保存每张素材的 SHA-256 与文件大小，便于追踪实际使用的图片版本。一次任务可以继续直接上传 `branches`，两种方式不能混用，避免分店顺序产生歧义。配置目录默认在 `prototype/franchiseflow/brand_profiles/`，已加入 Git 忽略规则。
 
 配置还可以带 `default_fit=contain`。当每个场景只有一个通过验证的平面时，系统会自动把这个素材适配策略写入每个分支。多平面场景默认使用 `surface_policy=review` 并要求显式 `asset_bindings`；确认每个分店素材都应覆盖所有招牌平面时，才设置 `surface_policy=all_surfaces`。
 
