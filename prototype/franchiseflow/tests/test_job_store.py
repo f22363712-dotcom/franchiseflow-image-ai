@@ -29,6 +29,12 @@ class JobStoreTests(unittest.TestCase):
     def test_missing_job_returns_none(self):
         self.assertIsNone(load_job(self.root, "missing"))
 
+    def test_rejects_path_like_job_id(self):
+        with self.assertRaises(ValueError):
+            create_job(self.root, "..", {})
+        with self.assertRaises(ValueError):
+            load_job(self.root, "../outside")
+
 
 if __name__ == "__main__":
     unittest.main()
