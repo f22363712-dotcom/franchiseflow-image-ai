@@ -22,7 +22,7 @@ FranchiseFlow 面向连锁品牌的视频本地化制作。用户上传一条连
  [SIFT/RANSAC/LK]   [拖动四角后继续]
         └────────┬────────┘
                  ▼
- [每个分支一条 H.264 MP4，输入有音频时保留音轨]
+ [每个分支一条带分店标签的 H.264 MP4，输入有音频时保留音轨]
 ```
 
 视觉模型只负责提出候选平面。每帧跟踪由本地 OpenCV 完成，模型不会被逐帧调用。RANSAC 内点拟合失败的帧写入 `tracking.jsonl`，该帧输出原画。每条成片在进入完成状态前还会经过 FFprobe 契约检查，确认 H.264、`yuv420p`、源视频尺寸、帧数、帧率和音频策略。模型网关错误、坐标响应不合法或成片契约不满足时，任务不会伪造成片。
@@ -37,7 +37,7 @@ python -m pip install -r requirements.txt
 python prototype/franchiseflow/app.py
 ```
 
-打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片，也可以填入品牌名或招牌外观提示帮助视觉定位。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；`GET /api/jobs?status=needs_review` 可以从持久化目录找回待复核任务。候选需要人工确认时，提交四角或 `surfaces[]` 到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口，若返回 `needs_review` 会同时给出 `job_id` 和复核地址。服务会拒绝超过 250 MiB 的上传、超过 60 秒的视频或超过 8 个硬切场景的视频。
+打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片，也可以填入品牌名或招牌外观提示帮助视觉定位。分店标签默认取上传文件名，也可以在 `POST /api/jobs` 的 `branch_labels` 字段提交 JSON 数组；标签会写入任务清单并进入输出文件名，避免批量交付时只看到 `branch_1`。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；`GET /api/jobs?status=needs_review` 可以从持久化目录找回待复核任务。候选需要人工确认时，提交四角或 `surfaces[]` 到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口，若返回 `needs_review` 会同时给出 `job_id` 和复核地址。服务会拒绝超过 250 MiB 的上传、超过 60 秒的视频或超过 8 个硬切场景的视频。
 
 视频输入支持 `.mp4`、`.mov`、`.m4v`、`.webm`、`.avi` 和 `.mkv`。非 MP4 源以及检测到 HEVC、H.265、ProRes、AV1、未知编码或非 `yuv420p` 像素格式的 MP4 会在任务创建时保留原文件，并用 FFmpeg 生成 `processing_input.mp4`（H.264、`yuv420p`、可选 AAC 音轨）供 OpenCV 和跟踪器使用。任务 JSON 与 `manifest.json` 会记录原始扩展名、工作文件名和解码器可见的尺寸、帧率、时长估计；场景采样阶段再顺序解码并记录实际帧数。
 

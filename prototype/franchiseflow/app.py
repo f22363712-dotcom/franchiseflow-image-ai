@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from candidate_validator import validate_candidate
 from job_store import create_job, load_job, save_job
-from tracker import _normalize_asset_bindings, parse_quad, run_tracker
+from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from vision_client import VisionClient
 from input_media import (
@@ -104,6 +104,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "processing_video_file": job.get("processing_video_file"),
         "video_metadata": job.get("video_metadata"),
         "branch_files": job.get("branch_files", []),
+        "branch_labels": job.get("branch_labels", []),
         "branch_count": job.get("branch_count"),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
@@ -159,6 +160,7 @@ def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any
             "created_at": job.get("created_at"),
             "updated_at": job.get("updated_at"),
             "branch_count": job.get("branch_count"),
+            "branch_labels": job.get("branch_labels", []),
             "scene_count": len(job.get("scenes", [])) if isinstance(job.get("scenes"), list) else None,
             "initialization_mode": job.get("initialization_mode"),
             "error": job.get("error"),
@@ -270,6 +272,22 @@ def _branch_files(request_files) -> list[Any]:
     return branches
 
 
+def _branch_labels(raw_value: str | None, branch_files: list[Any]) -> list[str]:
+    """Read optional human labels while keeping uploaded filenames as a fallback."""
+    labels = None
+    if raw_value:
+        try:
+            labels = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid branch_labels JSON: {exc}") from exc
+    if labels is None:
+        labels = [Path(item.filename).stem for item in branch_files]
+    try:
+        return normalize_branch_labels(labels, [Path(item.filename) for item in branch_files])
+    except ValueError as exc:
+        raise ValueError(f"Invalid branch_labels: {exc}") from exc
+
+
 def _create_job_from_request() -> dict[str, Any]:
     video_file = request.files.get("video")
     if video_file is None or not video_file.filename:
@@ -284,6 +302,7 @@ def _create_job_from_request() -> dict[str, Any]:
     for branch in branch_files:
         if Path(branch.filename).suffix.lower() not in ALLOWED_IMAGE_EXTS:
             raise ValueError(f"Branch image {branch.filename} has unsupported extension")
+    branch_labels = _branch_labels(request.form.get("branch_labels"), branch_files)
 
     job_id = uuid.uuid4().hex[:8]
     upload_dir = UPLOAD_DIR / job_id
@@ -379,6 +398,7 @@ def _create_job_from_request() -> dict[str, Any]:
         "processing_video_file": processing_video_name,
         "video_metadata": video_metadata,
         "branch_files": branch_names,
+        "branch_labels": branch_labels,
         "branch_count": len(branch_names),
         "initialization_mode": "manual_fallback" if manual else "vision_model",
         "manual_quad": manual_quad,
@@ -879,6 +899,7 @@ def _process_job(job_id: str) -> None:
             source_candidate=candidate,
             scene_plan=scene_plan or None,
             asset_bindings=asset_bindings,
+            branch_labels=job.get("branch_labels"),
         )
         summary["scene_count"] = len(scene_plan) if scene_plan else len(detected_scenes)
         summary["surface_count"] = sum(len(scene["surfaces"]) for scene in scene_plan) if scene_plan else 1

@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metrics import evaluate_tracking_quality
-from tracker import PlanarTracker, composite, main, probe_output_contract, project_quad, run_tracker, _normalize_scene_plan
+from tracker import PlanarTracker, composite, main, normalize_branch_labels, probe_output_contract, project_quad, run_tracker, _normalize_scene_plan
 
 
 def _create_textured_image(width=640, height=480):
@@ -184,6 +184,25 @@ class TrackerSyntheticTests(unittest.TestCase):
         five = run_tracker(video_path, quad, signs + extra, self.temp_dir / "five", no_debug=True)
         self.assertEqual(five["branch_count"], 5)
         self.assertEqual(len(five["output_videos"]), 5)
+
+    def test_branch_labels_are_preserved_in_outputs_and_manifest(self):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
+        summary = run_tracker(
+            video_path,
+            quad,
+            signs[:2],
+            self.temp_dir / "named_branches",
+            no_debug=True,
+            branch_labels=["滨河路店", "滨河路店"],
+        )
+        self.assertEqual(summary["branch_labels"], ["滨河路店", "滨河路店_2"])
+        self.assertEqual([Path(path).name for path in summary["output_videos"]], [
+            "branch_1_滨河路店.mp4", "branch_2_滨河路店_2.mp4",
+        ])
+
+    def test_branch_labels_reject_wrong_count(self):
+        with self.assertRaisesRegex(ValueError, "exactly 2 labels"):
+            normalize_branch_labels(["only_one"], ["a.png", "b.png"])
 
     def test_run_tracker_supports_two_independent_surfaces(self):
         video_path = self.temp_dir / "two_surfaces.mp4"

@@ -217,6 +217,20 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
 
+    def test_create_job_persists_explicit_branch_labels(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "one.png"), (_make_dummy_image("b2"), "two.png")],
+            "branch_labels": json.dumps(["滨河路店", "市中心店"], ensure_ascii=False),
+        }
+        with patch("app._submit_job"):
+            response = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertEqual(payload["branch_labels"], ["滨河路店", "市中心店"])
+        persisted = self.client.get(f"/api/jobs/{payload['job_id']}").get_json()
+        self.assertEqual(persisted["branch_labels"], ["滨河路店", "市中心店"])
+
     def test_list_jobs_reads_persisted_review_state(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
 import time
@@ -303,6 +304,32 @@ _INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate"
 _FIT_MODES = {"cover"}
 
 
+def normalize_branch_labels(labels: list[str] | None, signs: list[str | Path]) -> list[str]:
+    """Return stable, filesystem-safe names for branch output artifacts."""
+    if labels is None:
+        labels = [Path(sign).stem for sign in signs]
+    if not isinstance(labels, list) or len(labels) != len(signs):
+        raise ValueError(f"branch_labels must contain exactly {len(signs)} labels")
+    normalized: list[str] = []
+    used: set[str] = set()
+    for index, raw in enumerate(labels, start=1):
+        if not isinstance(raw, str):
+            raise ValueError("branch_labels entries must be strings")
+        label = re.sub(r"\s+", "_", raw.strip())
+        label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label)
+        label = label.strip(" ._")[:80]
+        if not label or label in {".", ".."}:
+            label = f"branch_{index}"
+        base = label
+        suffix = 2
+        while label.casefold() in used:
+            label = f"{base}_{suffix}"
+            suffix += 1
+        used.add(label.casefold())
+        normalized.append(label)
+    return normalized
+
+
 def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
     """Validate and normalize the stable scene/surface manifest.
 
@@ -435,6 +462,7 @@ def run_tracker(
     surface_quads: list[list] | None = None,
     scene_plan: list[dict] | None = None,
     asset_bindings: list[dict] | None = None,
+    branch_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     video_path = Path(video)
     if not video_path.exists():
@@ -447,6 +475,7 @@ def run_tracker(
     for sign_path in signs:
         if not Path(sign_path).exists():
             raise ValueError(f"sign does not exist: {sign_path}")
+    normalized_branch_labels = normalize_branch_labels(branch_labels, signs)
 
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -529,8 +558,8 @@ def run_tracker(
     loaded_signs = [load_sign(Path(p)) for p in signs]
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     height, width = first.shape[:2]
-    target_paths = [out_dir / f"branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
-    raw_paths = [out_dir / f"_raw_branch_{i+1}_{Path(p).stem}.mp4" for i, p in enumerate(signs)]
+    target_paths = [out_dir / f"branch_{i+1}_{label}.mp4" for i, label in enumerate(normalized_branch_labels)]
+    raw_paths = [out_dir / f"_raw_branch_{i+1}_{label}.mp4" for i, label in enumerate(normalized_branch_labels)]
     target_debug = out_dir / "tracking_debug.mp4"
     raw_debug = out_dir / "_raw_tracking_debug.mp4"
 
@@ -786,6 +815,7 @@ def run_tracker(
             "opencv_version": cv2.__version__,
             "numpy_version": np.__version__,
             "branch_count": len(signs),
+            "branch_labels": normalized_branch_labels,
             "surface_count": max_surface_count if normalized_scene_plan is not None else surface_count,
             "surface_quads": (
                 [surface.round(3).tolist() for scene in normalized_scene_plan for surface in [entry["quad"] for entry in scene["surfaces"]]]
