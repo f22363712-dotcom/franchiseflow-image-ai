@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,17 @@ def save_job(root: str | Path, job_id: str, job: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        # Windows file scanners and browser preview processes can briefly hold
+        # the destination open. Retry the atomic swap instead of losing the
+        # durable state update on a transient sharing violation.
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     finally:
         try:
             os.unlink(temp_name)

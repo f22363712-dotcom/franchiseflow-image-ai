@@ -7,6 +7,37 @@ from typing import Any
 import numpy as np
 
 
+DEFAULT_MAX_FAILED_FRACTION = 0.25
+
+
+def evaluate_tracking_quality(
+    records: list[dict[str, Any]],
+    total_frames: int,
+    *,
+    max_failed_fraction: float = DEFAULT_MAX_FAILED_FRACTION,
+) -> dict[str, Any]:
+    """Return a conservative review gate for partial tracking output."""
+    if not 0.0 <= max_failed_fraction <= 1.0:
+        raise ValueError("max_failed_fraction must be between 0 and 1")
+    failed_frames = [record.get("frame") for record in records if record.get("status") == "failed"]
+    denominator = max(total_frames - 1, 1)
+    failed_fraction = len(failed_frames) / denominator
+    passed = total_frames >= 2 and failed_fraction <= max_failed_fraction
+    reason = None
+    if total_frames < 2:
+        reason = "too_few_decodable_frames"
+    elif not passed:
+        reason = "failed_frame_fraction_exceeds_threshold"
+    return {
+        "status": "pass" if passed else "review",
+        "passed": passed,
+        "failed_frames": len(failed_frames),
+        "failed_fraction": round(failed_fraction, 4),
+        "max_failed_fraction": float(max_failed_fraction),
+        "reason": reason,
+    }
+
+
 def compute_summary(
     records: list[dict[str, Any]],
     fps: float,
@@ -41,6 +72,7 @@ def compute_summary(
         "reprojection_p95_px": float(np.percentile([r["reprojection_p95_px"] for r in tracked], 95)) if tracked and any("reprojection_p95_px" in r for r in tracked) else None,
         "processing_seconds": round(elapsed_seconds, 2),
         "output_videos": [str(Path(p).resolve()) for p in output_videos],
+        "quality_gate": evaluate_tracking_quality(records, total_frames),
     }
     if extra:
         summary.update(extra)

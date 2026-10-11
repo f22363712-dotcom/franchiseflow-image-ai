@@ -53,6 +53,94 @@ def transcode_to_h264(input_path: Path, output_path: Path, audio_source: Path | 
     return output_path
 
 
+def probe_output_contract(
+    path: Path,
+    *,
+    expected_frames: int,
+    expected_width: int,
+    expected_height: int,
+    expected_fps: float,
+    require_audio: bool,
+) -> dict:
+    """Validate the encoded artifact before exposing it as a finished branch.
+
+    FFmpeg's exit code only proves that an encode command completed.  The
+    browser-facing contract also requires an H.264/yuv420p video with the
+    source dimensions, a matching frame count, and the requested audio policy.
+    """
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        raise RuntimeError("FFprobe is required to validate rendered video outputs but was not found in PATH.")
+    if not path.exists() or path.stat().st_size <= 0:
+        raise RuntimeError(f"output validation failed: missing or empty file {path.name}")
+    result = subprocess.run(
+        [
+            ffprobe_bin,
+            "-v", "error",
+            "-count_frames",
+            "-show_streams",
+            "-show_format",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown ffprobe error").strip()
+        raise RuntimeError(f"output validation failed for {path.name}: {detail}")
+    try:
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams", [])
+        video = next(stream for stream in streams if stream.get("codec_type") == "video")
+    except (TypeError, ValueError, StopIteration, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"output validation failed for {path.name}: no readable video stream") from exc
+
+    codec = str(video.get("codec_name") or "")
+    pixel_format = str(video.get("pix_fmt") or "")
+    width = int(video.get("width") or 0)
+    height = int(video.get("height") or 0)
+    raw_frame_count = video.get("nb_read_frames") or video.get("nb_frames")
+    try:
+        frame_count = int(raw_frame_count)
+    except (TypeError, ValueError):
+        frame_count = 0
+    raw_rate = str(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1")
+    try:
+        numerator, denominator = raw_rate.split("/", 1)
+        fps = float(numerator) / float(denominator)
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    audio_present = any(stream.get("codec_type") == "audio" for stream in streams)
+    problems: list[str] = []
+    if codec != "h264":
+        problems.append(f"codec={codec or 'unknown'}")
+    if pixel_format != "yuv420p":
+        problems.append(f"pix_fmt={pixel_format or 'unknown'}")
+    if (width, height) != (expected_width, expected_height):
+        problems.append(f"size={width}x{height}, expected={expected_width}x{expected_height}")
+    if frame_count <= 0 or abs(frame_count - expected_frames) > 1:
+        problems.append(f"frames={frame_count}, expected={expected_frames}")
+    if expected_fps > 0 and (fps <= 0 or abs(fps - expected_fps) > max(0.1, expected_fps * 0.02)):
+        problems.append(f"fps={fps:.4f}, expected={expected_fps:.4f}")
+    if require_audio != audio_present:
+        problems.append(f"audio_present={audio_present}, expected={require_audio}")
+    if problems:
+        raise RuntimeError(f"output validation failed for {path.name}: " + "; ".join(problems))
+    return {
+        "file": path.name,
+        "validated": True,
+        "codec": codec,
+        "pix_fmt": pixel_format,
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+        "fps": round(fps, 6),
+        "audio_present": audio_present,
+    }
+
+
 
 def read_quad(path: Path) -> np.ndarray:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -623,8 +711,17 @@ def run_tracker(
 
     # Transcode OpenCV mp4v outputs to web-compatible H.264 (yuv420p + faststart)
     audio_present = bool(preserve_audio and has_audio_stream(video_path))
+    output_validation = []
     for raw_p, target_p in zip(raw_paths, target_paths):
         transcode_to_h264(raw_p, target_p, audio_source=video_path if audio_present else None)
+        output_validation.append(probe_output_contract(
+            target_p,
+            expected_frames=index,
+            expected_width=width,
+            expected_height=height,
+            expected_fps=float(fps),
+            require_audio=audio_present,
+        ))
         try:
             raw_p.unlink(missing_ok=True)
         except Exception:
@@ -702,6 +799,7 @@ def run_tracker(
             "model": model_name,
             "audio_policy": "preserve_input_audio" if preserve_audio else "disabled",
             "audio_present": audio_present,
+            "output_validation": output_validation,
             "source_candidate": source_candidate,
             "scene_count": len(scene_summary),
             "scenes": scene_summary,

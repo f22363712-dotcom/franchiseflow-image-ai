@@ -369,6 +369,32 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIsNotNone(payload["job_id"])
         tracker.assert_not_called()
 
+    def test_tracking_quality_gate_does_not_report_completed(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [{"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9}],
+        }
+        rejected_gate = {
+            "status": "review", "passed": False, "failed_frames": 1,
+            "failed_fraction": 1.0, "max_failed_fraction": 0.25,
+            "reason": "failed_frame_fraction_exceeds_threshold",
+        }
+        summary = {"frames": 2, "fps": 10.0, "failed_frames": [1], "output_videos": [], "quality_gate": rejected_gate}
+        with patch("app.VisionClient", return_value=mock_instance), \
+             patch("app.validate_candidate", return_value={"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}), \
+             patch("app.run_tracker", return_value=summary):
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 500)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "needs_review")
+        self.assertIsNotNone(payload["job_id"])
+        self.assertIn("quality gate", payload["error"])
+
     def test_overlapping_candidates_require_review_for_every_scene(self):
         data = {
             "video": (_make_two_scene_mp4(), "video.mp4"),

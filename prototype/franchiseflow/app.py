@@ -883,6 +883,21 @@ def _process_job(job_id: str) -> None:
         summary["scene_count"] = len(scene_plan) if scene_plan else len(detected_scenes)
         summary["surface_count"] = sum(len(scene["surfaces"]) for scene in scene_plan) if scene_plan else 1
         output_urls = [f"/outputs/{job_id}/{Path(path).name}" for path in summary.get("output_videos", [])]
+        quality_gate = summary.get("quality_gate")
+        if isinstance(quality_gate, dict) and not quality_gate.get("passed", False):
+            gate_reason = quality_gate.get("reason") or "tracking quality requires review"
+            job.update({
+                "status": "needs_review",
+                "phase": "quality_review",
+                "summary": _public_summary(summary),
+                "outputs": output_urls,
+                "output_urls": output_urls,
+                "initialization_mode": mode,
+                "error": f"tracking quality gate requires review: {gate_reason}",
+                "quality_gate": quality_gate,
+            })
+            _set_job(job)
+            return
         job.update({"status": "completed", "phase": "complete", "summary": _public_summary(summary), "outputs": output_urls, "output_urls": output_urls, "initialization_mode": mode})
     except CandidateReviewRequired as exc:
         job.update({

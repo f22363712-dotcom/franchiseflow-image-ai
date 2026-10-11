@@ -11,7 +11,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tracker import PlanarTracker, composite, main, project_quad, run_tracker, _normalize_scene_plan
+from metrics import evaluate_tracking_quality
+from tracker import PlanarTracker, composite, main, probe_output_contract, project_quad, run_tracker, _normalize_scene_plan
 
 
 def _create_textured_image(width=640, height=480):
@@ -34,6 +35,15 @@ class TrackerSyntheticTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_quality_gate_requires_review_when_failed_fraction_is_high(self):
+        gate = evaluate_tracking_quality(
+            [{"frame": 0, "status": "ok"}, {"frame": 1, "status": "failed"}, {"frame": 2, "status": "failed"}],
+            total_frames=3,
+        )
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["status"], "review")
+        self.assertEqual(gate["reason"], "failed_frame_fraction_exceeds_threshold")
 
     def _create_synthetic_fixture(self, num_frames=6, blank_frame_idx=3):
         video_path = self.temp_dir / "synthetic.mp4"
@@ -98,6 +108,8 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertEqual(summary["frames"], 6)
         self.assertIn(3, summary["failed_frames"])
         self.assertEqual(len(summary["output_videos"]), 3)
+        self.assertTrue(all(item["validated"] for item in summary["output_validation"]))
+        self.assertTrue(all(item["codec"] == "h264" and item["pix_fmt"] == "yuv420p" for item in summary["output_validation"]))
 
         # Verify summary.json and tracking.jsonl
         self.assertTrue((out_dir / "summary.json").exists())
@@ -121,6 +133,29 @@ class TrackerSyntheticTests(unittest.TestCase):
                 count += 1
             cap.release()
             self.assertEqual(count, 6)
+
+    @patch("tracker.subprocess.run")
+    @patch("tracker.shutil.which", return_value="ffprobe")
+    def test_output_contract_rejects_wrong_codec(self, _which, run):
+        output = self.temp_dir / "wrong.mp4"
+        output.write_bytes(b"encoded")
+        run.return_value = type("Completed", (), {
+            "returncode": 0,
+            "stdout": json.dumps({"streams": [{
+                "codec_type": "video", "codec_name": "mpeg4", "pix_fmt": "yuv420p",
+                "width": 320, "height": 240, "nb_read_frames": "2", "avg_frame_rate": "10/1",
+            }]}),
+            "stderr": "",
+        })()
+        with self.assertRaisesRegex(RuntimeError, "output validation failed.*codec=mpeg4"):
+            probe_output_contract(
+                output,
+                expected_frames=2,
+                expected_width=320,
+                expected_height=240,
+                expected_fps=10.0,
+                require_audio=False,
+            )
 
     def test_run_tracker_validates_inputs(self):
         # Missing video

@@ -23,6 +23,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const metricInitMode = document.getElementById('metric-init-mode');
   const metricScenes = document.getElementById('metric-scenes');
   const metricSurfaces = document.getElementById('metric-surfaces');
+  const metricOutputContract = document.getElementById('metric-output-contract');
   const sceneReviewControls = document.getElementById('scene-review-controls');
   const scenePicker = document.getElementById('review-scene-picker');
   const surfacePicker = document.getElementById('review-surface-picker');
@@ -374,6 +375,10 @@ document.addEventListener('DOMContentLoaded', () => {
       ? job.scenes.reduce((count, scene) => count + (Array.isArray(scene.surfaces) ? scene.surfaces.length : 0), 0)
       : null;
     if (metricSurfaces) metricSurfaces.textContent = summary.surface_count != null ? summary.surface_count : (inferredSurfaces || '-');
+    if (metricOutputContract) {
+      const checks = Array.isArray(summary.output_validation) ? summary.output_validation : [];
+      metricOutputContract.textContent = checks.length && checks.every(item => item.validated) ? `已验收 ${checks.length} 条` : (mode === 'manual_fallback' ? '样片基线' : '-');
+    }
   }
 
   function renderOutputs(urls) {
@@ -401,6 +406,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const multiScene = setupSceneReview(job);
     if (job.asset_bindings_required) {
       reviewReasons.textContent = '检测到多个可替换平面。当前提交会把每个分支素材明确应用到全部已复核平面；需要逐平面分配时请改用 API 的 asset_bindings。';
+    }
+    if (job.quality_gate && job.quality_gate.passed === false) {
+      const gate = job.quality_gate;
+      reviewReasons.textContent = `跟踪质量需要复核：失败帧 ${gate.failed_frames || 0}，失败比例 ${(Number(gate.failed_fraction || 0) * 100).toFixed(1)}%，阈值 ${(Number(gate.max_failed_fraction || 0) * 100).toFixed(1)}%。`;
     }
     if (multiScene) return;
     if (sceneReviewControls) sceneReviewControls.hidden = true;
