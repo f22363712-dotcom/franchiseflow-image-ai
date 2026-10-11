@@ -32,6 +32,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const scenePicker = document.getElementById('review-scene-picker');
   const surfacePicker = document.getElementById('review-surface-picker');
   const sceneReviewSummary = document.getElementById('scene-review-summary');
+  const brandProfileInput = document.getElementById('brand-profile-input');
+  const brandProfileOptions = document.getElementById('brand-profile-options');
+  const brandProfileStatus = document.getElementById('brand-profile-status');
 
   let branchInputs = [];
   let activeJobId = null;
@@ -46,6 +49,40 @@ document.addEventListener('DOMContentLoaded', () => {
   const sceneQuads = new Map();
   const sceneSurfaces = new Map();
   let previewRenderToken = 0;
+  let brandProfiles = new Map();
+
+  async function loadBrandProfiles() {
+    if (!brandProfileOptions) return;
+    try {
+      const response = await fetch('/api/brand-profiles');
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '读取品牌配置失败');
+      brandProfiles = new Map((payload.profiles || []).map(profile => [String(profile.profile_id), profile]));
+      brandProfileOptions.replaceChildren(...[...brandProfiles.values()].map(profile => {
+        const option = document.createElement('option');
+        option.value = String(profile.profile_id);
+        option.label = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).length} 个分店`;
+        return option;
+      }));
+      if (brandProfileStatus) brandProfileStatus.textContent = brandProfiles.size ? `已载入 ${brandProfiles.size} 个本地配置，可从列表选择。` : '暂无本地配置，可直接上传分支图片。';
+    } catch (error) {
+      if (brandProfileStatus) brandProfileStatus.textContent = '品牌配置列表暂时不可用，可继续直接上传分支图片。';
+    }
+  }
+
+  function updateBrandProfileStatus() {
+    if (!brandProfileStatus || !brandProfileInput) return;
+    const profile = brandProfiles.get(brandProfileInput.value.trim());
+    if (profile) {
+      const policy = profile.surface_policy === 'all_surfaces' ? '全平面映射' : '多平面需复核';
+      brandProfileStatus.textContent = `${profile.brand_name || profile.profile_id} · ${(profile.branch_labels || []).join('、')} · ${policy}`;
+    } else if (brandProfileInput.value.trim()) {
+      brandProfileStatus.textContent = '未找到这个配置 ID，请从列表选择或检查拼写。';
+    }
+  }
+
+  brandProfileInput && brandProfileInput.addEventListener('input', updateBrandProfileStatus);
+  loadBrandProfiles();
 
   function addBranchInput() {
     if (branchInputs.length >= 10) return;
@@ -510,7 +547,6 @@ document.addEventListener('DOMContentLoaded', () => {
     event.preventDefault();
     const files = branchInputs.map(input => input.files[0]).filter(Boolean);
     if (!videoInput.files[0]) return alert('请先选择门店视频');
-    const brandProfileInput = document.getElementById('brand-profile-input');
     const brandProfileId = brandProfileInput ? brandProfileInput.value.trim() : '';
     if (!brandProfileId && !files.length) return alert('请至少选择一张分支招牌图片，或填写品牌配置 ID');
     if (brandProfileId && files.length) return alert('使用品牌配置时请清空本次上传的分支图片');

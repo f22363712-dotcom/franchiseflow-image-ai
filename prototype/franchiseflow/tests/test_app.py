@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, _normalise_candidate, _public_summary
+from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, _locate_scenes, _normalise_candidate, _public_summary
 from job_store import create_job, load_job, save_job
 from scene_samples import sample_video_scenes
 
@@ -74,6 +74,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn(b"/api/jobs", res.data)
         self.assertIn(b"needs_review", res.data)
         self.assertIn(b"review-quad", res.data)
+        self.assertIn(b"brand-profile-options", res.data)
 
 
     def test_missing_video_returns_400(self):
@@ -188,6 +189,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn("redrawReview", app_js)
         self.assertIn("quality-review", app_js)
         self.assertIn("brand_profile_id", app_js)
+        self.assertIn("/api/brand-profiles", app_js)
+        self.assertIn("brand-profile-options", app_js)
 
     def test_quality_review_can_accept_or_reject_rendered_batch(self):
         accepted_id = f"quality_accept_test_{uuid.uuid4().hex[:6]}"
@@ -265,6 +268,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 201)
             profile = response.get_json()
             self.assertEqual(profile["profile_id"], profile_id)
+            self.assertEqual(profile["scene_reuse_policy"], "vision_each_scene")
             self.assertEqual(profile["branch_labels"], ["滨河路店", "市中心店"])
             self.assertEqual(len(profile["branch_files"]), 2)
             self.assertEqual(len(profile["branch_assets"]), 2)
@@ -277,6 +281,27 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(fetched.get_json()["target_hint"], "dark charcoal fascia with white wordmark")
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_verified_scene_reuse_skips_second_vision_call(self):
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        scenes = [
+            {"scene_id": "scene_001", "start_frame": 0, "end_frame": 1, "samples": [(0, frame), (1, frame)]},
+            {"scene_id": "scene_002", "start_frame": 2, "end_frame": 3, "samples": [(2, frame), (3, frame)]},
+        ]
+        candidate = {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9}
+        transferred = {"quad": [[30, 25], [110, 25], [110, 85], [30, 85]], "confidence": 0.88}
+        validation = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        with tempfile.TemporaryDirectory(prefix="ff_scene_reuse_app_") as sample_dir, \
+             patch("app._locate_and_validate", return_value=([candidate], [validation], "gemini-3.1-flash-image", {"model": "gemini-3.1-flash-image", "candidate_count": 1})) as locate, \
+             patch("app.transfer_candidate", return_value=transferred), \
+             patch("app.validate_candidate", return_value=validation):
+            views, plan, model, audit = _locate_scenes(
+                Path("unused.mp4"), scenes, Path(sample_dir), None, "reuse-test", scene_reuse_policy="reuse_if_verified"
+            )
+        self.assertEqual(locate.call_count, 1)
+        self.assertEqual([item["initialization_mode"] for item in views], ["vision_model", "reused_candidate"])
+        self.assertEqual([item["surfaces"][0]["initialization_mode"] for item in plan], ["vision_model", "reused_candidate"])
+        self.assertEqual(audit["scenes"][1]["source"], "scene_reuse")
 
     def test_job_reuses_brand_profile_without_branch_uploads(self):
         profile_id = f"test_reuse_{uuid.uuid4().hex[:8]}"

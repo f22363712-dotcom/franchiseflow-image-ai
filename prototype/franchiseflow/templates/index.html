@@ -75,7 +75,9 @@
               <span>复用品牌配置（可选）</span>
               <span class="label-hint">先通过 API 创建配置</span>
             </label>
-            <input id="brand-profile-input" name="brand_profile_id" class="text-input" type="text" maxlength="64" placeholder="例如：north-star">
+            <input id="brand-profile-input" name="brand_profile_id" class="text-input" type="text" maxlength="64" list="brand-profile-options" placeholder="例如：north-star">
+            <datalist id="brand-profile-options"></datalist>
+            <p class="mode-tip" id="brand-profile-status">正在读取本地品牌配置…</p>
             <p class="mode-tip">填写后会沿用配置中的分店图片、标签和识别提示，本次不要再上传分支图片。</p>
           </div>
 

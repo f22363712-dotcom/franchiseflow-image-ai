@@ -341,7 +341,7 @@ def parse_quad(value: Any) -> np.ndarray:
     return quad
 
 
-_INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate"}
+_INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate", "reused_candidate"}
 _FIT_MODES = {"cover", "contain"}
 
 
@@ -512,7 +512,7 @@ def run_tracker(
         raise ValueError(f"video does not exist: {video_path}")
     if not 1 <= len(signs) <= 10:
         raise ValueError(f"between 1 and 10 signs are required, got {len(signs)}")
-    if initialization_mode not in {"vision_model", "manual_fallback", "reviewed_candidate"}:
+    if initialization_mode not in _INITIALIZATION_MODES:
         raise ValueError(f"unsupported initialization mode: {initialization_mode}")
     normalized_scene_plan = _normalize_scene_plan(scene_plan)
     for sign_path in signs:
@@ -680,9 +680,13 @@ def run_tracker(
                     }
                 elif active_scene is not None and index == active_scene["start_frame"]:
                     h = np.eye(3)
+                    first_frame_method = {
+                        "manual_fallback": "manual_first_frame",
+                        "reused_candidate": "reused_first_frame",
+                    }.get(surface_mode, "vision_first_frame")
                     surface_detail = {
                         "status": "ok",
-                        "method": "manual_first_frame" if surface_mode == "manual_fallback" else "vision_first_frame",
+                        "method": first_frame_method,
                         "quad": surface_quad.tolist(),
                         "inliers": len(tracker.key0),
                         "reprojection_median_px": 0.0,
@@ -690,9 +694,13 @@ def run_tracker(
                     }
                 elif active_scene is None and index == 0:
                     h = np.eye(3)
+                    first_frame_method = {
+                        "manual_fallback": "manual_first_frame",
+                        "reused_candidate": "reused_first_frame",
+                    }.get(initialization_mode, "vision_first_frame")
                     surface_detail = {
                         "status": "ok",
-                        "method": "manual_first_frame" if initialization_mode == "manual_fallback" else "vision_first_frame",
+                        "method": first_frame_method,
                         "quad": surface_quad.tolist(),
                         "inliers": len(tracker.key0),
                         "reprojection_median_px": 0.0,
@@ -943,7 +951,7 @@ def main():
     parser.add_argument("--illumination", action="store_true", help="approximate low-frequency lighting, not occlusion handling")
     parser.add_argument("--no-occlusion-preservation", action="store_true", help="disable conservative foreground-preservation hints")
     parser.add_argument("--no-debug", action="store_true")
-    parser.add_argument("--initialization-mode", choices=["vision_model", "manual_fallback", "reviewed_candidate"], default=None)
+    parser.add_argument("--initialization-mode", choices=["vision_model", "manual_fallback", "reviewed_candidate", "reused_candidate"], default=None)
     parser.add_argument("--model", dest="model_name", default=None)
     args = parser.parse_args()
 

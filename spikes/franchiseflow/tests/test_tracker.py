@@ -186,6 +186,21 @@ class TrackerSyntheticTests(unittest.TestCase):
         self.assertEqual(five["branch_count"], 5)
         self.assertEqual(len(five["output_videos"]), 5)
 
+    def test_run_tracker_records_reused_candidate_initialization(self):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
+        summary = run_tracker(
+            video_path,
+            quad,
+            signs[:1],
+            self.temp_dir / "reused",
+            no_debug=True,
+            initialization_mode="reused_candidate",
+        )
+        self.assertEqual(summary["initialization_mode"], "reused_candidate")
+        records = (self.temp_dir / "reused" / "tracking.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        first = json.loads(records[0])
+        self.assertEqual(first["method"], "reused_first_frame")
+
     def test_branch_labels_are_preserved_in_outputs_and_manifest(self):
         video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
         summary = run_tracker(

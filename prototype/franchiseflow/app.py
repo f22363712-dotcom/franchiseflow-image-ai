@@ -28,6 +28,7 @@ from job_store import create_job, load_job, save_job
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
+from scene_reuse import transfer_candidate
 from vision_client import VisionClient
 from input_media import (
     SUPPORTED_SOURCE_EXTS,
@@ -114,6 +115,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "brand_profile_id": job.get("brand_profile_id"),
         "brand_profile_default_fit": job.get("brand_profile_default_fit"),
         "brand_profile_surface_policy": job.get("brand_profile_surface_policy"),
+        "brand_profile_scene_reuse_policy": job.get("brand_profile_scene_reuse_policy"),
         "brand_profile_assets": job.get("brand_profile_assets", []),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
@@ -467,6 +469,7 @@ def _create_job_from_request() -> dict[str, Any]:
         "brand_profile_id": brand_profile_id,
         "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
         "brand_profile_surface_policy": brand_profile.get("surface_policy") if brand_profile else None,
+        "brand_profile_scene_reuse_policy": brand_profile.get("scene_reuse_policy") if brand_profile else None,
         "brand_profile_assets": brand_profile.get("branch_assets", []) if brand_profile else [],
         "output_urls": [],
     })
@@ -754,18 +757,85 @@ def _validate_manual_candidate(scene: dict[str, Any], candidate: dict[str, Any])
     return {**validation, "source": "manual_fallback"}
 
 
-def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: Path, target_hint: str | None, job_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, dict[str, Any]]:
+def _reuse_scene_candidates(
+    anchor_frame: np.ndarray,
+    anchor_candidates: list[dict[str, Any]],
+    scene: dict[str, Any],
+    source_scene_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None:
+    """Transfer every prior surface only when each one passes fresh checks."""
+    transferred: list[dict[str, Any]] = []
+    validations: list[dict[str, Any]] = []
+    for candidate in anchor_candidates:
+        projected = transfer_candidate(anchor_frame, scene["samples"][0][1], candidate.get("quad"))
+        if projected is None:
+            return None
+        validation = validate_candidate(scene["samples"], projected)
+        if not validation.get("accepted"):
+            return None
+        projected["reason"] = f"validated_reuse_from_{source_scene_id}"
+        transferred.append(projected)
+        validations.append({**validation, "source": "scene_reuse", "source_scene_id": source_scene_id})
+    for left_index, left in enumerate(transferred):
+        for right in transferred[left_index + 1:]:
+            overlap = _quad_overlap_ratio(left["quad"], right["quad"])
+            if overlap >= SURFACE_OVERLAP_THRESHOLD:
+                return None
+    return transferred, validations, {
+        "model": "scene_reuse",
+        "source": "scene_reuse",
+        "source_scene_id": source_scene_id,
+        "candidate_count": len(transferred),
+        "accepted_candidate_count": len(transferred),
+        "surface_count": len(transferred),
+        "validation_reasons": [item.get("reasons", []) for item in validations],
+    }
+
+
+def _locate_scenes(
+    video_path: Path,
+    scenes: list[dict[str, Any]],
+    sample_dir: Path,
+    target_hint: str | None,
+    job_id: str,
+    scene_reuse_policy: str = "vision_each_scene",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, dict[str, Any]]:
     """Locate up to four non-overlapping planar surfaces per scene."""
     views: list[dict[str, Any]] = []
     plan: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     model_name: str | None = None
+    previous_anchor: np.ndarray | None = None
+    previous_candidates: list[dict[str, Any]] | None = None
+    previous_scene_id: str | None = None
     for scene in scenes:
         scene_dir = sample_dir / scene["scene_id"]
         samples = scene["samples"]
+        reused = None
+        reuse_attempted = bool(
+            scene_reuse_policy == "reuse_if_verified"
+            and previous_anchor is not None
+            and previous_candidates
+            and previous_scene_id
+        )
+        if reuse_attempted:
+            reused = _reuse_scene_candidates(previous_anchor, previous_candidates, scene, previous_scene_id)
         try:
-            candidates, validations, model, audit = _locate_and_validate(video_path, samples, scene_dir, target_hint)
+            if reused is not None:
+                candidates, validations, audit = reused
+                model = "scene_reuse"
+            else:
+                candidates, validations, model, audit = _locate_and_validate(video_path, samples, scene_dir, target_hint)
+                if reuse_attempted:
+                    audit["reuse_attempted"] = True
+                    audit["reuse_fallback"] = True
+                    audit["reuse_source_scene_id"] = previous_scene_id
         except CandidateReviewRequired as exc:
+            review_audit = dict(exc.audit)
+            if reuse_attempted:
+                review_audit["reuse_attempted"] = True
+                review_audit["reuse_fallback"] = True
+                review_audit["reuse_source_scene_id"] = previous_scene_id
             views.append(_scene_view(
                 scene,
                 f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg",
@@ -776,30 +846,34 @@ def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: P
                 candidates=exc.candidates,
                 validations=exc.validations,
             ))
-            audits.append(exc.audit)
+            audits.append(review_audit)
             model_name = model_name or exc.model
             continue
+        mode = "reused_candidate" if reused is not None else "vision_model"
         view = _scene_view(
             scene,
             f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg",
             candidates[0],
             validations[0],
             status="validated",
-            mode="vision_model",
+            mode=mode,
             candidates=candidates,
             validations=validations,
         )
         views.append(view)
         plan.append(_scene_plan_entry(
             scene,
-            mode="vision_model",
+            mode=mode,
             surfaces=[
-                {"surface_id": f"{scene['scene_id']}_surface_{index:03d}", "quad": item["quad"], "status": "validated", "initialization_mode": "vision_model"}
+                {"surface_id": f"{scene['scene_id']}_surface_{index:03d}", "quad": item["quad"], "status": "validated", "initialization_mode": mode}
                 for index, item in enumerate(candidates, start=1)
             ],
         ))
         audits.append(audit)
         model_name = model_name or model
+        previous_anchor = samples[0][1]
+        previous_candidates = candidates
+        previous_scene_id = str(scene["scene_id"])
     return views, plan, model_name, {
         "scenes": audits,
         "scene_count": len(scenes),
@@ -959,7 +1033,14 @@ def _process_job(job_id: str) -> None:
             mode = "vision_model"
             job["phase"] = "vision_candidates"
             _set_job(job)
-            scene_views, scene_plan, model_name, vision_audit = _locate_scenes(video_path, detected_scenes, sample_dir, job.get("target_hint"), job_id)
+            scene_views, scene_plan, model_name, vision_audit = _locate_scenes(
+                video_path,
+                detected_scenes,
+                sample_dir,
+                job.get("target_hint"),
+                job_id,
+                scene_reuse_policy=job.get("brand_profile_scene_reuse_policy", "vision_each_scene"),
+            )
             unresolved = [scene for scene in scene_views if scene.get("status") != "validated"]
             if unresolved:
                 first_unresolved = unresolved[0]
@@ -1145,6 +1226,7 @@ def create_brand_profile_endpoint():
         profile_id = (request.form.get("profile_id") or f"brand_{uuid.uuid4().hex[:10]}").strip()
         default_fit = request.form.get("default_fit", "cover")
         surface_policy = request.form.get("surface_policy", "review")
+        scene_reuse_policy = request.form.get("scene_reuse_policy", "vision_each_scene")
         with tempfile.TemporaryDirectory(prefix="franchiseflow-profile-") as temporary:
             sources: list[Path] = []
             for index, branch in enumerate(branch_files, start=1):
@@ -1172,6 +1254,7 @@ def create_brand_profile_endpoint():
                 branch_sources=sources,
                 default_fit=default_fit,
                 surface_policy=surface_policy,
+                scene_reuse_policy=scene_reuse_policy,
             )
     except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
