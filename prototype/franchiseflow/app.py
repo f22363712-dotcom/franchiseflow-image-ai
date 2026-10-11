@@ -28,6 +28,7 @@ from job_store import create_job, load_job, save_job
 from batch_store import create_batch, load_batch, save_batch
 from batch_delivery import BatchPackageError, build_batch_package
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
+from idempotency_store import IdempotencyConflict, IdempotencyError, IdempotencyStore, normalize_key, request_fingerprint
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from scene_reuse import transfer_candidate
@@ -52,6 +53,7 @@ BATCH_DIR = OUTPUT_DIR / "batches"
 BATCH_DIR.mkdir(parents=True, exist_ok=True)
 BATCH_PACKAGE_DIR = BATCH_DIR / "packages"
 BATCH_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+IDEMPOTENCY_STORE = IdempotencyStore(OUTPUT_DIR / "idempotency.json")
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -83,6 +85,7 @@ JOBS: dict[str, dict[str, Any]] = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="franchiseflow")
 FUTURES: dict[str, Any] = {}
 FUTURE_LOCK = threading.Lock()
+IDEMPOTENCY_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
 SYNC_ACTIVE = 0
 _RECOVERY_STARTED = False
@@ -164,6 +167,38 @@ def _job(job_id: str) -> dict[str, Any] | None:
     if job is not None:
         JOBS[job_id] = job
     return job
+
+
+def _idempotency_identity(scope: str) -> tuple[str, str] | None:
+    """Return the normalized key and request fingerprint when opted in."""
+    key = normalize_key(request.headers.get("Idempotency-Key"))
+    if key is None:
+        return None
+    return key, request_fingerprint(request, scope)
+
+
+def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[str, Any] | None, int] | None:
+    """Return a previously created resource, or raise on payload mismatch."""
+    entry = IDEMPOTENCY_STORE.get(scope, key)
+    if entry is None:
+        return None
+    if entry.get("fingerprint") != fingerprint:
+        raise IdempotencyConflict("Idempotency-Key was already used with a different request")
+    resource_id = str(entry.get("resource_id") or "")
+    resource = _job(resource_id) if scope == "jobs" else None
+    if scope == "batches" and resource_id:
+        try:
+            batch = load_batch(BATCH_DIR, resource_id)
+        except (ValueError, RuntimeError, OSError):
+            batch = None
+        resource = _batch_public(batch) if batch is not None else None
+    if resource is None:
+        raise IdempotencyError("Idempotency-Key points to a missing resource")
+    return resource, int(entry.get("status_code", 202))
+
+
+def _idempotency_record(scope: str, key: str, fingerprint: str, resource_id: str, status_code: int) -> None:
+    IDEMPOTENCY_STORE.put(scope, key, fingerprint, resource_id, status_code=status_code)
 
 
 def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
@@ -1409,8 +1444,7 @@ def get_brand_profile_endpoint(profile_id: str):
     return jsonify(profile)
 
 
-@app.route("/api/batches", methods=["POST"])
-def create_batch_endpoint():
+def _create_batch_endpoint_impl():
     """Submit several videos against one reusable brand profile.
 
     Every video remains an ordinary FranchiseFlow job, so review, retry and
@@ -1493,6 +1527,36 @@ def create_batch_endpoint():
     return jsonify(response), 202
 
 
+@app.route("/api/batches", methods=["POST"])
+def create_batch_endpoint():
+    try:
+        identity = _idempotency_identity("batches")
+    except IdempotencyError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if identity is None:
+        return _create_batch_endpoint_impl()
+    key, fingerprint = identity
+    with IDEMPOTENCY_LOCK:
+        try:
+            replay = _idempotency_replay("batches", key, fingerprint)
+        except IdempotencyConflict as exc:
+            return jsonify({"error": str(exc)}), 409
+        except IdempotencyError as exc:
+            return jsonify({"error": str(exc)}), 409
+        if replay is not None:
+            resource, status_code = replay
+            return jsonify(resource), status_code
+        response = _create_batch_endpoint_impl()
+        payload = response[0].get_json(silent=True) if isinstance(response, tuple) else response.get_json(silent=True)
+        status_code = response[1] if isinstance(response, tuple) else response.status_code
+        if status_code == 202 and isinstance(payload, dict) and payload.get("batch_id"):
+            try:
+                _idempotency_record("batches", key, fingerprint, payload["batch_id"], status_code)
+            except (IdempotencyError, OSError, RuntimeError) as exc:
+                return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        return response
+
+
 @app.route("/api/batches/<batch_id>", methods=["GET"])
 def get_batch_endpoint(batch_id: str):
     try:
@@ -1564,8 +1628,7 @@ def list_batches_endpoint():
     return jsonify({"batches": batches[:limit]})
 
 
-@app.route("/api/jobs", methods=["POST"])
-def create_job_endpoint():
+def _create_job_endpoint_impl():
     if _active_slot_count() >= MAX_ACTIVE_JOBS:
         return jsonify({"error": f"active job queue is full ({MAX_ACTIVE_JOBS} jobs); try again later"}), 429
     job = None
@@ -1582,6 +1645,36 @@ def create_job_endpoint():
             job["error"] = str(exc)
             _set_job(job)
         return jsonify({"error": str(exc)}), 429
+
+
+@app.route("/api/jobs", methods=["POST"])
+def create_job_endpoint():
+    try:
+        identity = _idempotency_identity("jobs")
+    except IdempotencyError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if identity is None:
+        return _create_job_endpoint_impl()
+    key, fingerprint = identity
+    with IDEMPOTENCY_LOCK:
+        try:
+            replay = _idempotency_replay("jobs", key, fingerprint)
+        except IdempotencyConflict as exc:
+            return jsonify({"error": str(exc)}), 409
+        except IdempotencyError as exc:
+            return jsonify({"error": str(exc)}), 409
+        if replay is not None:
+            resource, status_code = replay
+            return jsonify(resource), status_code
+        response = _create_job_endpoint_impl()
+        payload = response[0].get_json(silent=True) if isinstance(response, tuple) else response.get_json(silent=True)
+        status_code = response[1] if isinstance(response, tuple) else response.status_code
+        if status_code == 202 and isinstance(payload, dict) and payload.get("job_id"):
+            try:
+                _idempotency_record("jobs", key, fingerprint, payload["job_id"], status_code)
+            except (IdempotencyError, OSError, RuntimeError) as exc:
+                return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
+        return response
 
 
 @app.route("/api/jobs", methods=["GET"])

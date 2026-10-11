@@ -133,6 +133,8 @@ curl -X POST http://127.0.0.1:5000/api/jobs/<job_id>/retry
 
 批次索引采用原子 JSON 写入。Windows 文件短暂占用时会自动重试；本地存储不可用时返回 HTTP 507，并清理已创建的临时子任务。
 
+需要让网络重试安全时，可以给 `POST /api/jobs` 或 `POST /api/batches` 加上 `Idempotency-Key` 请求头。相同接口、相同 key 和相同上传内容会返回原来的 `job_id` 或 `batch_id`，不会再次创建任务；同一接口复用 key 但上传内容或表单字段变化会返回 HTTP 409。映射保存在 `prototype/franchiseflow/outputs/idempotency.json`，采用临时文件加原子替换写入，服务重启后仍可识别已提交资源。不传请求头时保持原有行为。当前实现使用本地单进程锁，适合单机 worker；多进程或多副本部署需要换成共享存储和分布式锁。
+
 批次可以下载可审计的 ZIP 交付包：
 
 ```bash

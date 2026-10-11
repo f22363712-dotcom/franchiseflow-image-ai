@@ -286,6 +286,83 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
 
+    def test_job_idempotency_replays_original_and_rejects_payload_change(self):
+        key = f"job-replay-{uuid.uuid4().hex}"
+
+        def build_data(label="b1"):
+            return {
+                "video": (_make_dummy_mp4(), "video.mp4"),
+                "branches": [(_make_dummy_image(label), "b1.png")],
+            }
+
+        with patch("app._submit_job") as submit:
+            first = self.client.post(
+                "/api/jobs",
+                data=build_data(),
+                headers={"Idempotency-Key": key},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(first.status_code, 202)
+            first_payload = first.get_json()
+            JOBS.clear()  # prove the retry reads the durable resource record
+            replay = self.client.post(
+                "/api/jobs",
+                data=build_data(),
+                headers={"Idempotency-Key": key},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(replay.status_code, 202)
+            self.assertEqual(replay.get_json()["job_id"], first_payload["job_id"])
+            changed = self.client.post(
+                "/api/jobs",
+                data=build_data("changed"),
+                headers={"Idempotency-Key": key},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(changed.status_code, 409)
+            self.assertIn("different request", changed.get_json()["error"])
+            submit.assert_called_once_with(first_payload["job_id"])
+
+    def test_batch_idempotency_replays_original_without_duplicate_children(self):
+        profile_id = f"test_batch_idempotency_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Idempotent Batch Brand",
+            "branches": [(_make_dummy_image("a"), "a.png")],
+        }
+
+        def build_data():
+            return {
+                "brand_profile_id": profile_id,
+                "videos": [(_make_dummy_mp4(), "one.mp4"), (_make_dummy_mp4(), "two.mp4")],
+            }
+
+        try:
+            self.assertEqual(self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data").status_code, 201)
+            key = f"batch-replay-{uuid.uuid4().hex}"
+            submitted: list[str] = []
+            with patch("app._submit_job", side_effect=lambda job_id: submitted.append(job_id)):
+                first = self.client.post(
+                    "/api/batches",
+                    data=build_data(),
+                    headers={"Idempotency-Key": key},
+                    content_type="multipart/form-data",
+                )
+                self.assertEqual(first.status_code, 202)
+                first_payload = first.get_json()
+                replay = self.client.post(
+                    "/api/batches",
+                    data=build_data(),
+                    headers={"Idempotency-Key": key},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(replay.status_code, 202)
+            self.assertEqual(replay.get_json()["batch_id"], first_payload["batch_id"])
+            self.assertEqual(replay.get_json()["job_ids"], first_payload["job_ids"])
+            self.assertEqual(submitted, first_payload["job_ids"])
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
     def test_brand_profile_can_be_created_and_listed(self):
         profile_id = f"test_brand_{uuid.uuid4().hex[:8]}"
         data = {

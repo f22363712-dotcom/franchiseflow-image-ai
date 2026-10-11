@@ -95,6 +95,7 @@ python prototype/franchiseflow/app.py
 - 页面新增“批量本地化生产”区域。选择已保存的品牌配置后可以一次提交最多 8 条视频，页面轮询批次状态并展示每条成片链接；单条任务需要人工复核时，可从批次卡片打开原有复核面板。批次也可以通过 `POST /api/batches` 和 `GET /api/batches/<batch_id>` 使用。
 - 批次中的 `failed` 或 `vision_failed` 子任务会显示“重试此视频”。重试沿用原任务 ID、视频和分店素材，清除旧输出后重新进入队列；队列满或存储异常会恢复原失败状态和产物。
 - 批次交付可以调用 `GET /api/batches/<batch_id>/download` 获取 ZIP。根目录 `batch_manifest.json` 列出所有子任务及状态；只有已完成且文件路径校验通过的任务才会包含 `jobs/<job_id>/manifest.json`、MP4 和 SHA-256/字节数清单。未完成、失败、人工复核或缺少成片的任务只保留状态，不会进入视频目录；没有任何可交付子任务时接口返回 409。
+- `POST /api/jobs` 和 `POST /api/batches` 支持可选的 `Idempotency-Key` 请求头。同一接口、同一 key 和相同表单/文件内容会返回原来的资源，不会创建重复任务；同一接口复用 key 但请求内容变化会返回 HTTP 409。不带该请求头时保持原有行为。key、请求指纹和资源 ID 写入 `prototype/franchiseflow/outputs/idempotency.json`，原子替换保存，服务重启后仍可恢复；当前实现使用单进程锁，多副本部署需换共享存储与分布式锁。
 
 ### 4.2 运行全量自动化测试
 ```powershell
