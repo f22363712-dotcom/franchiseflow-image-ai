@@ -1642,6 +1642,11 @@ def retry_job(job_id: str):
             return jsonify({"error": f"could not prepare retry outputs: {exc}"}), 507
     previous = dict(job)
     retry_job_state = dict(job)
+    preserve_reviewed_plan = (
+        job.get("initialization_mode") == "reviewed_candidate"
+        and isinstance(job.get("scene_plan"), list)
+        and bool(job.get("scene_plan"))
+    )
     retry_job_state.update({
         "status": "queued",
         "phase": "queued",
@@ -1652,18 +1657,23 @@ def retry_job(job_id: str):
         "output_urls": [],
         "quality_gate": None,
         "quality_review": None,
-        "candidate": None,
-        "candidates": [],
-        "validation": None,
-        "validations": [],
         "vision_audit": None,
-        "scenes": [],
-        "scene_plan": [],
         "sample_preview": None,
         "contact_sheet_preview": None,
         "model": None,
-        "asset_bindings": None,
+        # Explicit bindings remain valid across a retry. They may have been
+        # supplied by the operator for a multi-surface scene.
+        "asset_bindings": job.get("asset_bindings"),
     })
+    if not preserve_reviewed_plan:
+        retry_job_state.update({
+            "candidate": None,
+            "candidates": [],
+            "validation": None,
+            "validations": [],
+            "scenes": [],
+            "scene_plan": [],
+        })
     try:
         _set_job(retry_job_state)
         _submit_job(job_id)

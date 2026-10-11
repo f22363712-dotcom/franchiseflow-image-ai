@@ -749,6 +749,46 @@ class FranchiseFlowAppTests(unittest.TestCase):
             shutil.rmtree(OUTPUT_DIR / ".retry-backups", ignore_errors=True)
             (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
 
+    def test_retry_preserves_human_reviewed_scene_plan_and_bindings(self):
+        job_id = f"retry_reviewed_{uuid.uuid4().hex[:8]}"
+        upload_dir = UPLOAD_DIR / job_id
+        output_dir = OUTPUT_DIR / job_id
+        scene_plan = [{
+            "scene_id": "scene_001",
+            "start_frame": 0,
+            "end_frame": 1,
+            "surfaces": [{
+                "surface_id": "scene_001_surface_001",
+                "quad": [[20, 20], [100, 20], [100, 80], [20, 80]],
+            }],
+        }]
+        bindings = [{"branch_index": 1, "surface_ids": ["scene_001_surface_001"], "fit": "cover"}]
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (upload_dir / "video.mp4").write_bytes(b"source")
+            (upload_dir / "branch_1.png").write_bytes(b"branch")
+            (output_dir / "stale.mp4").write_bytes(b"stale")
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "failed", "phase": "failed", "error": "tracking failure",
+                "initialization_mode": "reviewed_candidate",
+                "video_file": "video.mp4", "processing_video_file": "video.mp4",
+                "branch_files": ["branch_1.png"], "branch_count": 1,
+                "scene_plan": scene_plan, "asset_bindings": bindings,
+            })
+            with patch("app._submit_job"):
+                response = self.client.post(f"/api/jobs/{job_id}/retry")
+            self.assertEqual(response.status_code, 202)
+            retried = response.get_json()
+            self.assertEqual(retried["initialization_mode"], "reviewed_candidate")
+            self.assertEqual(retried["scene_plan"], scene_plan)
+            self.assertEqual(retried["asset_bindings"], bindings)
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / ".retry-backups", ignore_errors=True)
+            (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
     def test_retry_rejects_completed_job_and_missing_inputs(self):
         job_id = f"retry_invalid_{uuid.uuid4().hex[:8]}"
         missing_id = f"retry_missing_{uuid.uuid4().hex[:8]}"
