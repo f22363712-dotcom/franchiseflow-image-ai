@@ -105,20 +105,18 @@ class VisionClient:
         if not self.api_key:
             raise RuntimeError("BANANA_API_KEY is missing; put it in the environment or .env")
 
-    def locate_sign(self, image_bytes: bytes, width: int, height: int, mime: str = "image/jpeg", target_hint: str | None = None) -> dict[str, Any]:
+    def locate_candidates(self, image_bytes: bytes, width: int, height: int, target_hint: str | None = None, mime: str = "image/jpeg") -> dict[str, Any]:
         encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = (
-            "Find the physical planar boundary of the storefront sign or flat advertising board in this image. "
-        )
+        prompt = "Find every clearly visible physical planar storefront sign or flat advertising board in this image. "
         if target_hint:
             prompt += f"Target description: {target_hint}. "
         else:
             prompt += "Target: the primary storefront sign (e.g. the dark gray board with 'STATE OF CONFUSION'). "
         prompt += (
-            "Return only JSON with keys quad, confidence, and reason. quad must be four image pixel "
-            "corners in clockwise order [top-left, top-right, bottom-right, bottom-left]. "
-            "Use pixel coordinates for the supplied image size. If no clear planar sign exists, use "
-            "quad:null and explain why. Bound the physical signboard polygon strictly; do not include brick walls, windows, doors, or street."
+            "Return only JSON with key candidates. candidates must be an array of objects with quad, confidence, and reason. "
+            "quad must be four image pixel corners in clockwise order [top-left, top-right, bottom-right, bottom-left]. "
+            "Use pixel coordinates for the supplied image size. If no clear planar sign exists, return an empty candidates array. "
+            "Bound each physical signboard polygon strictly; do not include brick walls, windows, doors, or street."
         )
         payload = {
             "model": self.model,
@@ -161,8 +159,42 @@ class VisionClient:
             answer = _json_from_text(str(content))
         except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("vision gateway returned an unexpected response shape") from exc
-        if answer.get("quad") is None:
-            raise RuntimeError(f"vision model could not find a replaceable planar sign: {answer.get('reason', 'no reason')}")
-        answer["quad"] = normalize_quad(answer["quad"], width, height)
-        answer["model"] = self.model
-        return answer
+
+        raw_candidates = answer.get("candidates")
+        if raw_candidates is None:
+            if answer.get("quad") is None:
+                raise RuntimeError(f"vision model could not find a replaceable planar sign: {answer.get('reason', 'no reason')}")
+            raw_candidates = [{"quad": answer.get("quad"), "confidence": answer.get("confidence", 0.0), "reason": answer.get("reason", "legacy single candidate")}]
+        if not isinstance(raw_candidates, list):
+            raise RuntimeError("vision gateway returned an unexpected candidate list")
+
+        candidates: list[dict[str, Any]] = []
+        invalid_reasons: list[str] = []
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, dict) or raw_candidate.get("quad") is None:
+                invalid_reasons.append("candidate_missing_quad")
+                continue
+            try:
+                quad = normalize_quad(raw_candidate["quad"], width, height)
+            except ValueError as exc:
+                invalid_reasons.append(str(exc))
+                continue
+            try:
+                confidence = float(raw_candidate.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            candidates.append({
+                "quad": quad,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "reason": str(raw_candidate.get("reason", "")),
+            })
+
+        if not candidates:
+            reason = answer.get("reason") or ", ".join(invalid_reasons) or "no candidates"
+            raise RuntimeError(f"vision model could not find a replaceable planar sign: {reason}")
+        return {"model": self.model, "candidates": candidates}
+
+    def locate_sign(self, image_bytes: bytes, width: int, height: int, mime: str = "image/jpeg", target_hint: str | None = None) -> dict[str, Any]:
+        result = self.locate_candidates(image_bytes, width, height, target_hint=target_hint, mime=mime)
+        candidate = result["candidates"][0]
+        return {**candidate, "model": result["model"]}

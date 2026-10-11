@@ -63,6 +63,30 @@ class VisionClientParsingTests(unittest.TestCase):
         self.assertEqual(result["quad"][2], [900.0, 250.0])
         self.assertEqual(result["model"], "GLM-5.3-flash")
 
+    def test_parses_multiple_candidates(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [
+                {"quad": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.5], [0.1, 0.5]], "confidence": 0.91, "reason": "sign"},
+                {"quad": [[0.2, 0.6], [0.4, 0.6], [0.4, 0.8], [0.2, 0.8]], "confidence": 0.42, "reason": "poster"},
+            ]
+        })}}]}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(payload).encode()
+
+        with patch("vision_client.urllib.request.urlopen", return_value=FakeResponse()):
+            result = VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(b"jpeg", 1000, 500)
+        self.assertEqual(result["model"], "gemini-3.1-flash-image")
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertEqual(result["candidates"][0]["quad"][2], [900.0, 250.0])
+
 
     def test_raises_on_http_403_without_leaking_body(self):
         secret_body = b'{"error": {"message": "upstream_secret_token_12345"}}'
