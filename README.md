@@ -37,7 +37,7 @@ python -m pip install -r requirements.txt
 python prototype/franchiseflow/app.py
 ```
 
-打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片，也可以填入品牌名或招牌外观提示帮助视觉定位。页面会读取本地品牌配置列表，选择配置后可以直接复用分店素材。分店标签默认取上传文件名，也可以在 `POST /api/jobs` 的 `branch_labels` 字段提交 JSON 数组；标签会写入任务清单并进入输出文件名，避免批量交付时只看到 `branch_1`。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；`GET /api/jobs?status=needs_review` 可以从持久化目录找回待复核任务。候选需要人工确认时，提交四角或 `surfaces[]` 到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。跟踪质量进入 `quality_review` 时，页面会播放已生成成片；人工决定后向 `POST /api/jobs/<job_id>/quality-review` 提交 `{"decision":"accept"}` 或 `{"decision":"reject"}`。旧的 `POST /api/render` 仍保留为同步兼容入口，若返回 `needs_review` 会同时给出 `job_id` 和复核地址。服务会拒绝超过 250 MiB 的上传、超过 60 秒的视频或超过 8 个硬切场景的视频。
+打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片，也可以填入品牌名或招牌外观提示帮助视觉定位。页面会读取本地品牌配置列表，选择配置后可以直接复用分店素材；也可以在“保存为品牌配置”面板中一次提交当前图片、品牌提示、分支标签和三项策略，保存成功后页面会自动选中新的配置 ID。分店标签默认取上传文件名，也可以在 `POST /api/jobs` 的 `branch_labels` 字段提交 JSON 数组；标签会写入任务清单并进入输出文件名，避免批量交付时只看到 `branch_1`。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；`GET /api/jobs?status=needs_review` 可以从持久化目录找回待复核任务。候选需要人工确认时，提交四角或 `surfaces[]` 到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。跟踪质量进入 `quality_review` 时，页面会播放已生成成片；人工决定后向 `POST /api/jobs/<job_id>/quality-review` 提交 `{"decision":"accept"}` 或 `{"decision":"reject"}`。旧的 `POST /api/render` 仍保留为同步兼容入口，若返回 `needs_review` 会同时给出 `job_id` 和复核地址。服务会拒绝超过 250 MiB 的上传、超过 60 秒的视频或超过 8 个硬切场景的视频。
 
 视频输入支持 `.mp4`、`.mov`、`.m4v`、`.webm`、`.avi` 和 `.mkv`。非 MP4 源以及检测到 HEVC、H.265、ProRes、AV1、未知编码或非 `yuv420p` 像素格式的 MP4 会在任务创建时保留原文件，并用 FFmpeg 生成 `processing_input.mp4`（H.264、`yuv420p`、可选 AAC 音轨）供 OpenCV 和跟踪器使用。任务 JSON 与 `manifest.json` 会记录原始扩展名、工作文件名和解码器可见的尺寸、帧率、时长估计；场景采样阶段再顺序解码并记录实际帧数。
 
@@ -106,9 +106,22 @@ curl -X POST http://127.0.0.1:5000/api/brand-profiles \
 
 创建任务时只上传视频并传 `brand_profile_id=north-star`，系统会复制配置中的图片到任务目录，并沿用标签和 `target_hint`。配置和任务清单会保存每张素材的 SHA-256 与文件大小，便于追踪实际使用的图片版本。一次任务可以继续直接上传 `branches`，两种方式不能混用，避免分店顺序产生歧义。配置目录默认在 `prototype/franchiseflow/brand_profiles/`，已加入 Git 忽略规则。
 
+自动定位时，任务会把前四张分店素材作为可选的品牌外观参考图，与视频联系图一起发送给视觉模型。提示词明确参考图只用于判断品牌外观，四角坐标只能来自视频画面；每张参考图的 SHA-256 会写入视觉审计，便于确认模型实际看到的素材版本。参考图不能替代多帧几何验证，模型仍可能返回需要人工复核的候选。
+
 配置还可以带 `default_fit=contain`。当每个场景只有一个通过验证的平面时，系统会自动把这个素材适配策略写入每个分支。多平面场景默认使用 `surface_policy=review` 并要求显式 `asset_bindings`；确认每个分店素材都应覆盖所有招牌平面时，才设置 `surface_policy=all_surfaces`。
 
 `scene_reuse_policy` 默认是 `vision_each_scene`。设置为 `reuse_if_verified` 后，后续镜头会先用 SIFT/RANSAC 把上一镜已验证平面投影到当前镜头，再跑当前镜头的多帧验证；任一条件不满足就调用视觉模型重新定位，并在审计记录中标注回退原因。
+
+同一品牌需要处理多条门店视频时，可以把已保存的品牌配置复用到一个批次。批次仍按单任务保存每条视频的输入、审计与输出，单条任务需要人工复核时不会被其他视频的结果覆盖：
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/batches \
+  -F 'brand_profile_id=north-star' \
+  -F 'videos=@shoot_a.mp4' \
+  -F 'videos=@shoot_b.mp4'
+```
+
+响应会返回 `batch_id` 和每条视频的 `job_id`。使用 `GET /api/batches/<batch_id>` 查看批次状态，或用 `GET /api/batches?limit=20` 找回最近批次；使用原有的 `GET /api/jobs/<job_id>`、`/review` 与 `/outputs` 查看和处理单条任务。批次一次最多接收 8 条视频；本地 worker 忙时，多出的任务保持 `queued`，等待已有任务结束后自动排队。
 
 ## Tests
 

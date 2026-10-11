@@ -75,6 +75,7 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn(b"needs_review", res.data)
         self.assertIn(b"review-quad", res.data)
         self.assertIn(b"brand-profile-options", res.data)
+        self.assertIn(b"btn-save-brand-profile", res.data)
 
 
     def test_missing_video_returns_400(self):
@@ -191,6 +192,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn("brand_profile_id", app_js)
         self.assertIn("/api/brand-profiles", app_js)
         self.assertIn("brand-profile-options", app_js)
+        self.assertIn("btn-save-brand-profile", app_js)
+        self.assertIn("saveCurrentBrandProfile", app_js)
 
     def test_quality_review_can_accept_or_reject_rendered_batch(self):
         accepted_id = f"quality_accept_test_{uuid.uuid4().hex[:6]}"
@@ -328,6 +331,71 @@ class FranchiseFlowAppTests(unittest.TestCase):
             submit.assert_called_once_with(job["job_id"])
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_batch_submits_multiple_videos_against_one_brand_profile(self):
+        profile_id = f"test_batch_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Batch Brand",
+            "branch_labels": json.dumps(["A 店"], ensure_ascii=False),
+            "branches": [(_make_dummy_image("a"), "a.png")],
+        }
+        try:
+            created_profile = self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data")
+            self.assertEqual(created_profile.status_code, 201)
+            submitted: list[str] = []
+            data = {
+                "brand_profile_id": profile_id,
+                "videos": [(_make_dummy_mp4(), "one.mp4"), (_make_dummy_mp4(), "two.mp4")],
+            }
+            with patch("app._submit_job", side_effect=lambda job_id: submitted.append(job_id)):
+                response = self.client.post("/api/batches", data=data, content_type="multipart/form-data")
+            self.assertEqual(response.status_code, 202)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "queued")
+            self.assertEqual(payload["brand_profile_id"], profile_id)
+            self.assertEqual(payload["requested_count"], 2)
+            self.assertEqual(len(payload["job_ids"]), 2)
+            self.assertEqual(submitted, payload["job_ids"])
+            fetched = self.client.get(f"/api/batches/{payload['batch_id']}")
+            self.assertEqual(fetched.status_code, 200)
+            fetched_payload = fetched.get_json()
+            self.assertEqual(fetched_payload["status"], "queued")
+            self.assertEqual([item["brand_profile_id"] for item in [self.client.get(f"/api/jobs/{job_id}").get_json() for job_id in payload["job_ids"]]], [profile_id, profile_id])
+            listed = self.client.get("/api/batches?limit=5")
+            self.assertEqual(listed.status_code, 200)
+            self.assertTrue(any(item["batch_id"] == payload["batch_id"] for item in listed.get_json()["batches"]))
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_batch_requires_profile_and_rejects_branch_uploads(self):
+        data = {"videos": [(_make_dummy_mp4(), "one.mp4")]}
+        response = self.client.post("/api/batches", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("brand_profile_id", response.get_json()["error"])
+
+    def test_batch_keeps_children_queued_when_worker_pool_is_full(self):
+        profile_id = f"test_batch_queue_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Batch Queue Brand",
+            "branches": [(_make_dummy_image("a"), "a.png")],
+        }
+        try:
+            self.assertEqual(self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data").status_code, 201)
+            data = {
+                "brand_profile_id": profile_id,
+                "videos": [(_make_dummy_mp4(), "one.mp4"), (_make_dummy_mp4(), "two.mp4")],
+            }
+            with patch("app._submit_job", side_effect=RuntimeError("active job queue is full (4 jobs); try again later")):
+                response = self.client.post("/api/batches", data=data, content_type="multipart/form-data")
+            self.assertEqual(response.status_code, 202)
+            payload = response.get_json()
+            self.assertEqual(payload["queued_waiting_for_worker"], 2)
+            self.assertEqual(payload["counts"]["queued"], 2)
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
 
     def test_brand_profile_default_fit_maps_single_surface(self):
         profile_id = f"test_fit_{uuid.uuid4().hex[:8]}"
@@ -541,6 +609,10 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(persisted["target_hint"], "Acme Coffee neon fascia")
         mock_instance.locate_candidates.assert_called_once()
         self.assertEqual(mock_instance.locate_candidates.call_args.kwargs["target_hint"], "Acme Coffee neon fascia")
+        references = mock_instance.locate_candidates.call_args.kwargs["reference_images"]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0][1], "image/png")
+        self.assertEqual(references[0][0], (_make_dummy_image("b1").getvalue()))
 
     def test_each_scene_can_pass_multiple_stable_surfaces_to_tracker(self):
         data = {

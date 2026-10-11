@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from candidate_validator import validate_candidate
 from job_store import create_job, load_job, save_job
+from batch_store import create_batch, load_batch, save_batch
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
 from tracker import _normalize_asset_bindings, normalize_branch_labels, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
@@ -46,6 +47,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_DIR = BASE_DIR / "brand_profiles"
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+BATCH_DIR = OUTPUT_DIR / "batches"
+BATCH_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -58,6 +61,10 @@ MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 MAX_VIDEO_SECONDS = 60.0
 MAX_SCENES = 8
 MAX_ACTIVE_JOBS = 4
+# A batch is deliberately bounded. Each item still uses the normal single-job
+# pipeline and durable job record; this limit prevents one request from
+# filling the local queue indefinitely.
+MAX_BATCH_VIDEOS = 8
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_SURFACES_PER_SCENE = 4
@@ -102,6 +109,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
     summary = job.get("summary") or {}
     manifest = {
         "job_id": job.get("job_id"),
+        "batch_id": job.get("batch_id"),
         "status": job.get("status"),
         "phase": job.get("phase"),
         "created_at": job.get("created_at"),
@@ -168,6 +176,7 @@ def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any
             continue
         jobs.append({
             "job_id": job.get("job_id", state_path.parent.name),
+            "batch_id": job.get("batch_id"),
             "status": job.get("status"),
             "phase": job.get("phase"),
             "created_at": job.get("created_at"),
@@ -322,8 +331,17 @@ def _parse_manual_scene_quads(raw_value: str | None) -> list[list[list[float]]] 
         raise ValueError(f"Invalid manual_scene_quads: {exc}") from exc
 
 
-def _create_job_from_request() -> dict[str, Any]:
-    video_file = request.files.get("video")
+def _create_job_from_request(
+    video_file_override: Any | None = None,
+    batch_id_override: str | None = None,
+) -> dict[str, Any]:
+    """Create one durable job from the current request.
+
+    ``video_file_override`` is used only by ``/api/batches`` so each uploaded
+    video can pass through the exact same validation and storage path as
+    ``/api/jobs`` without mutating Flask's request files.
+    """
+    video_file = video_file_override if video_file_override is not None else request.files.get("video")
     if video_file is None or not video_file.filename:
         raise ValueError("Missing video file")
     if Path(video_file.filename).suffix.lower() not in ALLOWED_VIDEO_EXTS:
@@ -455,6 +473,7 @@ def _create_job_from_request() -> dict[str, Any]:
     job = create_job(OUTPUT_DIR, job_id, {
         "status": "queued",
         "phase": "queued",
+        "batch_id": batch_id_override,
         "video_file": video_name,
         "processing_video_file": processing_video_name,
         "video_metadata": video_metadata,
@@ -482,6 +501,26 @@ def _paths(job: dict[str, Any]) -> tuple[Path, list[Path], Path]:
     upload_dir = UPLOAD_DIR / job_id
     processing_name = job.get("processing_video_file") or job["video_file"]
     return upload_dir / processing_name, [upload_dir / name for name in job["branch_files"]], OUTPUT_DIR / job_id
+
+
+def _read_brand_reference_images(sign_paths: list[Path]) -> list[tuple[bytes, str]]:
+    """Load uploaded branch artwork as optional appearance references.
+
+    The vision client caps the number and size of references.  This helper
+    keeps file/path concerns in the web layer and preserves the original
+    branch files for compositing unchanged.
+    """
+    mime_by_suffix = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    references: list[tuple[bytes, str]] = []
+    for path in sign_paths[:4]:
+        mime = mime_by_suffix.get(path.suffix.lower())
+        if mime is None:
+            continue
+        try:
+            references.append((path.read_bytes(), mime))
+        except OSError:
+            continue
+    return references
 
 
 def _normalise_candidate(candidate: dict[str, Any], scale: float, panel_width: int | None = None, panel_count: int | None = None) -> dict[str, Any]:
@@ -560,14 +599,26 @@ def _review_candidate_error(
     )
 
 
-def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]], sample_dir: Path, target_hint: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]:
+def _locate_and_validate(
+    video_path: Path,
+    samples: list[tuple[int, np.ndarray]],
+    sample_dir: Path,
+    target_hint: str | None,
+    reference_images: list[tuple[bytes, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]:
     contact_sheet, panel_width, panel_height, scale = _save_contact_sheet(samples, sample_dir)
     first_height, first_width = samples[0][1].shape[:2]
     client = VisionClient()
     panel_count = len(samples)
     sheet_width = panel_width * panel_count
     try:
-        result = client.locate_candidates(contact_sheet, sheet_width, panel_height, target_hint=target_hint)
+        result = client.locate_candidates(
+            contact_sheet,
+            sheet_width,
+            panel_height,
+            target_hint=target_hint,
+            reference_images=reference_images,
+        )
     except RuntimeError as exc:
         # Invalid/no-candidate model output is recoverable by drawing a quad in
         # the review UI.  Network/authentication failures remain hard errors.
@@ -577,19 +628,29 @@ def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]]
                 "input_sha256": hashlib.sha256(contact_sheet).hexdigest(),
                 "candidate_count": 0,
                 "model": str(getattr(client, "model", "unknown")),
+                "reference_asset_count": len(reference_images or []),
+                "reference_asset_sha256": [hashlib.sha256(item[0]).hexdigest() for item in (reference_images or [])],
             }
             raise _review_candidate_error([], audit["model"], audit, message) from exc
         raise
     # Keep old mocked clients and old gateways usable during migration.
     if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
         encoded_first = cv2.imencode(".jpg", samples[0][1])[1].tobytes()
-        legacy = client.locate_sign(encoded_first, first_width, first_height, target_hint=target_hint)
+        legacy = client.locate_sign(
+            encoded_first,
+            first_width,
+            first_height,
+            target_hint=target_hint,
+            reference_images=reference_images,
+        )
         result = {"model": legacy.get("model", client.model), "candidates": [legacy]}
 
     audit = {
         "input_sha256": hashlib.sha256(contact_sheet).hexdigest(),
         "candidate_count": len(result["candidates"]),
         "model": str(result.get("model", client.model)),
+        "reference_asset_count": len(reference_images or []),
+        "reference_asset_sha256": [hashlib.sha256(item[0]).hexdigest() for item in (reference_images or [])],
     }
 
     model = str(result.get("model", client.model))
@@ -799,6 +860,7 @@ def _locate_scenes(
     target_hint: str | None,
     job_id: str,
     scene_reuse_policy: str = "vision_each_scene",
+    reference_images: list[tuple[bytes, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, dict[str, Any]]:
     """Locate up to four non-overlapping planar surfaces per scene."""
     views: list[dict[str, Any]] = []
@@ -825,7 +887,13 @@ def _locate_scenes(
                 candidates, validations, audit = reused
                 model = "scene_reuse"
             else:
-                candidates, validations, model, audit = _locate_and_validate(video_path, samples, scene_dir, target_hint)
+                candidates, validations, model, audit = _locate_and_validate(
+                    video_path,
+                    samples,
+                    scene_dir,
+                    target_hint,
+                    reference_images=reference_images,
+                )
                 if reuse_attempted:
                     audit["reuse_attempted"] = True
                     audit["reuse_fallback"] = True
@@ -943,6 +1011,7 @@ def _process_job(job_id: str) -> None:
         job["phase"] = "sampling"
         _set_job(job)
         video_path, sign_paths, output_dir = _paths(job)
+        reference_images = _read_brand_reference_images(sign_paths)
         detected_scenes = sample_video_scenes(video_path, max_scenes=MAX_SCENES)
         samples = detected_scenes[0]["samples"]
         sample_dir = output_dir / "samples"
@@ -1040,6 +1109,7 @@ def _process_job(job_id: str) -> None:
                 job.get("target_hint"),
                 job_id,
                 scene_reuse_policy=job.get("brand_profile_scene_reuse_policy", "vision_each_scene"),
+                reference_images=reference_images,
             )
             unresolved = [scene for scene in scene_views if scene.get("status") != "validated"]
             if unresolved:
@@ -1195,6 +1265,59 @@ def _schedule_queued_jobs() -> None:
             break
 
 
+def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
+    """Return a batch manifest plus current public state for each child job."""
+    job_ids = [str(item) for item in batch.get("job_ids", [])]
+    jobs: list[dict[str, Any]] = []
+    for job_id in job_ids:
+        job = _job(job_id)
+        if job is None:
+            jobs.append({"job_id": job_id, "status": "missing"})
+            continue
+        jobs.append({
+            "job_id": job_id,
+            "status": job.get("status"),
+            "phase": job.get("phase"),
+            "branch_count": job.get("branch_count"),
+            "branch_labels": job.get("branch_labels", []),
+            "error": job.get("error"),
+            "outputs": job.get("outputs", []),
+            "summary": job.get("summary", {}),
+        })
+    statuses = [item.get("status") for item in jobs]
+    if not statuses:
+        status = "failed"
+    elif all(item == "completed" for item in statuses):
+        status = "completed"
+    elif any(item in {"failed", "vision_failed", "missing"} for item in statuses):
+        status = "partial_failed" if any(item == "completed" for item in statuses) else "failed"
+    elif any(item == "needs_review" for item in statuses):
+        status = "needs_review"
+    elif any(item == "running" for item in statuses):
+        status = "running"
+    else:
+        status = "queued"
+    counts = {
+        "total": len(statuses),
+        "completed": sum(item == "completed" for item in statuses),
+        "running": sum(item == "running" for item in statuses),
+        "queued": sum(item == "queued" for item in statuses),
+        "needs_review": sum(item == "needs_review" for item in statuses),
+        "failed": sum(item in {"failed", "vision_failed", "missing"} for item in statuses),
+    }
+    return {
+        "batch_id": batch.get("batch_id"),
+        "status": status,
+        "brand_profile_id": batch.get("brand_profile_id"),
+        "requested_count": batch.get("requested_count", len(job_ids)),
+        "counts": counts,
+        "job_ids": job_ids,
+        "jobs": jobs,
+        "created_at": batch.get("created_at"),
+        "updated_at": batch.get("updated_at"),
+    }
+
+
 @app.before_request
 def _recover_jobs_for_wsgi() -> None:
     """Recover durable work when the module is loaded by a WSGI server."""
@@ -1275,6 +1398,111 @@ def get_brand_profile_endpoint(profile_id: str):
     if profile is None:
         return jsonify({"error": "Brand profile not found"}), 404
     return jsonify(profile)
+
+
+@app.route("/api/batches", methods=["POST"])
+def create_batch_endpoint():
+    """Submit several videos against one reusable brand profile.
+
+    Every video remains an ordinary FranchiseFlow job, so review, retry and
+    output download keep using the existing job endpoints. The batch record is
+    only an index and never hides a failed child job.
+    """
+    profile_id = (request.form.get("brand_profile_id") or "").strip()
+    if not profile_id:
+        return jsonify({"error": "brand_profile_id is required for a batch"}), 400
+    if _branch_files(request.files):
+        return jsonify({"error": "batch requests use the brand profile assets; do not upload branches"}), 400
+    videos = [item for item in request.files.getlist("videos") if item and item.filename]
+    # Accept ``video`` as a one-item alias for clients that build fields
+    # dynamically, while keeping ``videos`` the documented multi-file field.
+    if not videos:
+        videos = [item for item in request.files.getlist("video") if item and item.filename]
+    if not 1 <= len(videos) <= MAX_BATCH_VIDEOS:
+        return jsonify({"error": f"1 to {MAX_BATCH_VIDEOS} videos required, got {len(videos)}"}), 400
+    try:
+        profile = load_profile(PROFILE_DIR, profile_id)
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if profile is None:
+        return jsonify({"error": f"brand profile not found: {profile_id}"}), 400
+    for video in videos:
+        if Path(video.filename).suffix.lower() not in ALLOWED_VIDEO_EXTS:
+            allowed = ", ".join(sorted(ALLOWED_VIDEO_EXTS))
+            return jsonify({"error": f"Video {video.filename} must use a supported video extension: {allowed}"}), 400
+
+    batch_id = uuid.uuid4().hex[:12]
+    batch = create_batch(BATCH_DIR, batch_id, {
+        "status": "queued",
+        "brand_profile_id": profile_id,
+        "requested_count": len(videos),
+        "job_ids": [],
+    })
+    created_jobs: list[dict[str, Any]] = []
+    try:
+        for video in videos:
+            created_jobs.append(_create_job_from_request(video_file_override=video, batch_id_override=batch_id))
+    except (ValueError, RuntimeError) as exc:
+        for job in created_jobs:
+            job_id = job.get("job_id")
+            if job_id:
+                JOBS.pop(job_id, None)
+                shutil.rmtree(UPLOAD_DIR / job_id, ignore_errors=True)
+                shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
+        (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
+        return jsonify({"error": str(exc), "batch_id": batch_id}), 400
+
+    batch["job_ids"] = [job["job_id"] for job in created_jobs]
+    save_batch(BATCH_DIR, batch_id, batch)
+    queued_count = 0
+    for job in created_jobs:
+        try:
+            _submit_job(job["job_id"])
+        except RuntimeError as exc:
+            # A full worker pool is expected for a batch. The durable queued
+            # state lets the normal scheduler pick this child up later.
+            if "active job queue is full" in str(exc).lower():
+                queued_count += 1
+                continue
+            job["status"] = "failed"
+            job["phase"] = "failed"
+            job["error"] = str(exc)
+            _set_job(job)
+    response = _batch_public(batch)
+    response["queued_waiting_for_worker"] = queued_count
+    return jsonify(response), 202
+
+
+@app.route("/api/batches/<batch_id>", methods=["GET"])
+def get_batch_endpoint(batch_id: str):
+    try:
+        batch = load_batch(BATCH_DIR, batch_id)
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if batch is None:
+        return jsonify({"error": "Batch not found"}), 404
+    return jsonify(_batch_public(batch))
+
+
+@app.route("/api/batches", methods=["GET"])
+def list_batches_endpoint():
+    """List durable batch indexes so clients can recover after a restart."""
+    raw_limit = request.args.get("limit", "20")
+    try:
+        limit = max(1, min(int(raw_limit), 100))
+    except ValueError:
+        return jsonify({"error": "limit must be an integer"}), 400
+    batches: list[dict[str, Any]] = []
+    for state_path in BATCH_DIR.glob("*.json"):
+        batch_id = state_path.stem
+        try:
+            batch = load_batch(BATCH_DIR, batch_id)
+        except (ValueError, RuntimeError, OSError):
+            continue
+        if batch is not None:
+            batches.append(_batch_public(batch))
+    batches.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return jsonify({"batches": batches[:limit]})
 
 
 @app.route("/api/jobs", methods=["POST"])

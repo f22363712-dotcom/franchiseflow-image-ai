@@ -15,7 +15,12 @@ import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+
+_REFERENCE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_REFERENCE_IMAGES = 4
+_MAX_REFERENCE_BYTES = 8 * 1024 * 1024
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -95,6 +100,35 @@ def normalize_quad(value: Any, width: int, height: int) -> list[list[float]]:
     return [[round(x, 3), round(y, 3)] for x, y in points]
 
 
+def _normalise_reference_images(
+    reference_images: Iterable[tuple[bytes, str]] | None,
+) -> list[tuple[bytes, str]]:
+    """Validate optional brand artwork before adding it to a vision request.
+
+    Reference images are appearance hints only.  Keeping this contract small
+    lets callers use profile assets without coupling the client to Flask paths
+    or a particular brand-profile representation.
+    """
+    if reference_images is None:
+        return []
+    result: list[tuple[bytes, str]] = []
+    for index, item in enumerate(reference_images):
+        if index >= _MAX_REFERENCE_IMAGES:
+            break
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("reference image must be a (bytes, mime) pair")
+        image_bytes, mime = item
+        if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+            raise ValueError("reference image bytes are empty")
+        mime = str(mime or "").lower().strip()
+        if mime not in _REFERENCE_MIME_TYPES:
+            raise ValueError(f"unsupported reference image MIME type: {mime or 'missing'}")
+        if len(image_bytes) > _MAX_REFERENCE_BYTES:
+            raise ValueError("reference image is larger than 8 MiB")
+        result.append((bytes(image_bytes), mime))
+    return result
+
+
 class VisionClient:
     def __init__(self, api_key: str | None = None, base_url: str | None = None, model: str | None = None, timeout: int = 45):
         load_env_file()
@@ -105,8 +139,17 @@ class VisionClient:
         if not self.api_key:
             raise RuntimeError("BANANA_API_KEY is missing; put it in the environment or .env")
 
-    def locate_candidates(self, image_bytes: bytes, width: int, height: int, target_hint: str | None = None, mime: str = "image/jpeg") -> dict[str, Any]:
+    def locate_candidates(
+        self,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+        target_hint: str | None = None,
+        mime: str = "image/jpeg",
+        reference_images: Iterable[tuple[bytes, str]] | None = None,
+    ) -> dict[str, Any]:
         encoded = base64.b64encode(image_bytes).decode("ascii")
+        references = _normalise_reference_images(reference_images)
         prompt = "Find every clearly visible physical planar storefront sign or flat advertising board in this image. "
         # The locator is intentionally brand-agnostic.  A concrete brand or
         # sign description is supplied by the caller when it is known; the
@@ -122,14 +165,30 @@ class VisionClient:
             "Use pixel coordinates for the full supplied image size (the input may contain three side-by-side video frames; do not reset x to a panel-local origin). If no clear planar sign exists, return an empty candidates array. "
             "Bound each physical signboard polygon strictly; do not include brick walls, windows, doors, or street."
         )
+        if references:
+            prompt += (
+                " The additional images after the scene image are approved brand-artwork references. "
+                "Use them only as appearance clues for which scene surface belongs to the brand; "
+                "return coordinates from the supplied scene image only, never from a reference image."
+            )
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": f"Image size is {width}x{height}. {prompt}"},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+        ]
+        for index, (reference_bytes, reference_mime) in enumerate(references, start=1):
+            content.append({
+                "type": "text",
+                "text": f"Approved brand artwork reference {index}. Do not locate or measure this reference image.",
+            })
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{reference_mime};base64,{base64.b64encode(reference_bytes).decode('ascii')}"},
+            })
         payload = {
             "model": self.model,
             "temperature": 0,
             "max_tokens": 300,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": f"Image size is {width}x{height}. {prompt}"},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-            ]}],
+            "messages": [{"role": "user", "content": content}],
         }
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
@@ -202,7 +261,22 @@ class VisionClient:
             raise RuntimeError(f"vision model could not find a replaceable planar sign: {reason}")
         return {"model": self.model, "candidates": candidates}
 
-    def locate_sign(self, image_bytes: bytes, width: int, height: int, mime: str = "image/jpeg", target_hint: str | None = None) -> dict[str, Any]:
-        result = self.locate_candidates(image_bytes, width, height, target_hint=target_hint, mime=mime)
+    def locate_sign(
+        self,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+        mime: str = "image/jpeg",
+        target_hint: str | None = None,
+        reference_images: Iterable[tuple[bytes, str]] | None = None,
+    ) -> dict[str, Any]:
+        result = self.locate_candidates(
+            image_bytes,
+            width,
+            height,
+            target_hint=target_hint,
+            mime=mime,
+            reference_images=reference_images,
+        )
         candidate = result["candidates"][0]
         return {**candidate, "model": result["model"]}

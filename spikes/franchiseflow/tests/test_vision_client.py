@@ -140,6 +140,43 @@ class VisionClientParsingTests(unittest.TestCase):
         prompt = captured["payload"]["messages"][0]["content"][0]["text"]
         self.assertNotIn("STATE OF CONFUSION", prompt)
 
+    def test_prompt_can_include_brand_artwork_references_without_mixing_coordinates(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [{"quad": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.5], [0.1, 0.5]]}]
+        })}}]}
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, _limit): return json.dumps(payload).encode()
+
+        def capture_request(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch("vision_client.urllib.request.urlopen", side_effect=capture_request):
+            VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(
+                b"scene-jpeg",
+                1000,
+                500,
+                target_hint="Acme Coffee fascia",
+                reference_images=[(b"approved-logo", "image/png")],
+            )
+
+        content = captured["payload"]["messages"][0]["content"]
+        self.assertEqual([item["type"] for item in content], ["text", "image_url", "text", "image_url"])
+        self.assertIn("approved brand-artwork references", content[0]["text"])
+        self.assertIn("Do not locate or measure this reference image", content[2]["text"])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertTrue(content[3]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_reference_image_rejects_unsupported_mime(self):
+        with self.assertRaises(ValueError):
+            VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(
+                b"jpeg", 1000, 500, reference_images=[(b"logo", "text/plain")]
+            )
+
     def test_rejects_response_with_any_mixed_coordinate_candidate(self):
         payload = {"choices": [{"message": {"content": json.dumps({
             "candidates": [
