@@ -1,11 +1,10 @@
-"""Small, deterministic hard-cut detector for FranchiseFlow videos.
+"""Small, deterministic hard-cut and dissolve detector for FranchiseFlow videos.
 
-The detector deliberately handles only hard edits. Camera motion, exposure
-changes, and short feature loss are left to the planar tracker. A cut is
-reported only when both the resized-frame difference and the colour-histogram
-change pass their thresholds. This keeps the scene layer conservative: a
-missed cut can be sent to review, while a false cut would create two unrelated
-tracking jobs from one continuous shot.
+Camera motion, exposure changes, and short feature loss are left to the planar
+tracker. Hard cuts require adjacent-frame evidence; dissolves require a wider
+window and are marked separately. This keeps the scene layer conservative: a
+missed transition can be sent to review, while a false split would create two
+unrelated tracking jobs from one continuous shot.
 """
 from __future__ import annotations
 
