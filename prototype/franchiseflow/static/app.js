@@ -270,7 +270,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const surface = Array.isArray(scene.surfaces) ? scene.surfaces[0] : null;
     const surfaceStatus = surface && surface.status ? ` · 平面 ${sceneStatus(surface)}` : '';
     const surfaceCount = candidateSurfaces(scene).length;
-    sceneReviewSummary.textContent = `${sceneRange(scene)} · 初始化 ${sceneInitMode(scene)} · ${sceneStatus(scene)} · ${surfaceCount || 0} 个平面${surfaceStatus}`;
+    const transition = scene.transition_type && scene.transition_type !== 'none' ? ` · 转场 ${scene.transition_type}` : '';
+    sceneReviewSummary.textContent = `${sceneRange(scene)}${transition} · 初始化 ${sceneInitMode(scene)} · ${sceneStatus(scene)} · ${surfaceCount || 0} 个平面${surfaceStatus}`;
     const reasons = (scene.validation && scene.validation.reasons) || (scene.candidate && scene.candidate.validation && scene.candidate.validation.reasons);
     reviewReasons.textContent = (reasons && reasons.length) ? reasons.join('、') : (sceneStatus(scene) === '需确认' ? '该场景的候选需要人工确认。' : '请检查招牌四角后提交。');
   }

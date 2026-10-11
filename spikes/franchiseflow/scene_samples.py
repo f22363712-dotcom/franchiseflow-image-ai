@@ -144,6 +144,7 @@ def sample_video_scenes(video_path: str | Path, *, max_scenes: int = 8) -> list[
             "end_frame": scene.end_frame,
             "cut_before": scene.cut_before,
             "cut_score": scene.cut_score,
+            "transition_type": scene.transition_type,
             "samples": [
                 (index, sampled_frames[index])
                 for index in _sample_indices(scene)

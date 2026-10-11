@@ -25,6 +25,7 @@ class SceneSegment:
     end_frame: int
     cut_before: int | None = None
     cut_score: float = 0.0
+    transition_type: str = "none"
 
     @property
     def frame_count(self) -> int:
@@ -39,6 +40,7 @@ class SceneSegment:
             "frame_count": self.frame_count,
             "cut_before": self.cut_before,
             "cut_score": round(float(self.cut_score), 6),
+            "transition_type": self.transition_type,
         }
 
 
@@ -94,16 +96,17 @@ def detect_scenes(
     difference_threshold: float = 0.30,
     histogram_threshold: float = 0.70,
     min_scene_frames: int = 2,
+    soft_window: int = 3,
+    soft_difference_threshold: float = 0.25,
+    soft_histogram_threshold: float = 0.25,
 ) -> list[SceneSegment]:
-    """Split sequential decoded frames at conservative hard cuts.
+    """Split frames at hard cuts and conservative dissolve boundaries.
 
-    ``frames`` must be ordered by source frame index. The function does not
-    decode a video or sample frames itself, which keeps it deterministic and
-    straightforward to unit-test. A cut is accepted when the adjacent pair
-    has a colour difference at least ``difference_threshold`` *and* histogram
-    correlation at most ``histogram_threshold``. Segments shorter than
-    ``min_scene_frames`` are merged with their predecessor (or successor for
-    the first segment).
+    A hard cut uses adjacent-frame scores. A dissolve is considered only when
+    frames on both sides of a short window differ strongly, the intervening
+    changes remain gradual, and the endpoint histograms are clearly different.
+    This gives downstream tracking a fresh anchor while preserving a marker in
+    the scene manifest so low-confidence transitions can still be reviewed.
     """
     if not 0.0 <= difference_threshold <= 1.0:
         raise ValueError("difference_threshold must be between 0 and 1")
@@ -111,35 +114,80 @@ def detect_scenes(
         raise ValueError("histogram_threshold must be between -1 and 1")
     if min_scene_frames < 1:
         raise ValueError("min_scene_frames must be at least 1")
+    if soft_window < 2:
+        raise ValueError("soft_window must be at least 2")
+    if not 0.0 <= soft_difference_threshold <= 1.0:
+        raise ValueError("soft_difference_threshold must be between 0 and 1")
+    if not -1.0 <= soft_histogram_threshold <= 1.0:
+        raise ValueError("soft_histogram_threshold must be between -1 and 1")
     if not frames:
         return []
 
-    previous_index, previous_frame = frames[0]
+    for position in range(1, len(frames)):
+        if frames[position][0] <= frames[position - 1][0]:
+            raise ValueError("scene detector frame indices must be strictly increasing")
+    if len(frames) == 1:
+        return [SceneSegment(scene_id="scene_001", start_frame=frames[0][0], end_frame=frames[0][0])]
+
+    pair_metrics: list[tuple[float, float, float]] = []
+    for position in range(1, len(frames)):
+        difference = frame_difference_score(frames[position - 1][1], frames[position][1])
+        correlation = histogram_correlation(frames[position - 1][1], frames[position][1])
+        pair_metrics.append((difference, correlation, _cut_score(difference, correlation)))
+
+    hard_boundaries = [
+        (position, pair_metrics[position - 1][2], "none")
+        for position in range(1, len(frames))
+        if pair_metrics[position - 1][0] >= difference_threshold and
+        pair_metrics[position - 1][1] <= histogram_threshold
+    ]
+    hard_positions = {item[0] for item in hard_boundaries}
+
+    soft_candidates: list[tuple[int, float]] = []
+    if len(frames) >= soft_window * 2:
+        for position in range(soft_window, len(frames) - soft_window + 1):
+            if any(abs(position - hard_position) <= soft_window for hard_position in hard_positions):
+                continue
+            before = frames[position - soft_window][1]
+            after = frames[position + soft_window - 1][1]
+            endpoint_difference = frame_difference_score(before, after)
+            endpoint_correlation = histogram_correlation(before, after)
+            local = pair_metrics[position - soft_window:position + soft_window - 1]
+            local_difference = float(np.median([item[0] for item in local])) if local else 1.0
+            if (endpoint_difference >= soft_difference_threshold and
+                    endpoint_correlation <= soft_histogram_threshold and
+                    local_difference < difference_threshold):
+                soft_candidates.append((position, _cut_score(endpoint_difference, endpoint_correlation)))
+
+    # Keep one strongest candidate per transition and never place it next to a
+    # hard cut. A gradual exposure shift therefore remains one scene.
+    accepted_soft: list[tuple[int, float, str]] = []
+    for position, score in sorted(soft_candidates, key=lambda item: item[1], reverse=True):
+        if any(abs(position - other[0]) < soft_window for other in accepted_soft):
+            continue
+        accepted_soft.append((position, score, "dissolve"))
+    boundaries = sorted(hard_boundaries + accepted_soft, key=lambda item: item[0])
+
     segments: list[SceneSegment] = []
     current_start_index = 0
     current_cut_before: int | None = None
     current_cut_score = 0.0
-
-    for position in range(1, len(frames)):
-        index, frame = frames[position]
-        if index <= previous_index:
-            raise ValueError("scene detector frame indices must be strictly increasing")
-        difference = frame_difference_score(previous_frame, frame)
-        correlation = histogram_correlation(previous_frame, frame)
-        score = _cut_score(difference, correlation)
-        is_cut = difference >= difference_threshold and correlation <= histogram_threshold
-        if is_cut and position - current_start_index >= min_scene_frames:
-            segments.append(SceneSegment(
-                scene_id=f"scene_{len(segments) + 1:03d}",
-                start_frame=frames[current_start_index][0],
-                end_frame=previous_index,
-                cut_before=current_cut_before,
-                cut_score=current_cut_score,
-            ))
-            current_start_index = position
-            current_cut_before = index
-            current_cut_score = score
-        previous_index, previous_frame = index, frame
+    current_transition = "none"
+    for position, score, transition_type in boundaries:
+        if position - current_start_index < min_scene_frames:
+            continue
+        segments.append(SceneSegment(
+            scene_id=f"scene_{len(segments) + 1:03d}",
+            start_frame=frames[current_start_index][0],
+            end_frame=frames[position - 1][0],
+            cut_before=current_cut_before,
+            cut_score=current_cut_score,
+            transition_type=current_transition,
+        ))
+        current_start_index = position
+        current_cut_before = frames[position][0]
+        current_cut_score = score
+        current_transition = transition_type
 
     segments.append(SceneSegment(
         scene_id=f"scene_{len(segments) + 1:03d}",
@@ -147,6 +195,7 @@ def detect_scenes(
         end_frame=frames[-1][0],
         cut_before=current_cut_before,
         cut_score=current_cut_score,
+        transition_type=current_transition,
     ))
 
     # A final short segment is usually a transition or accidental flash. Merge
@@ -159,10 +208,10 @@ def detect_scenes(
             end_frame=segments[-1].end_frame,
             cut_before=previous.cut_before,
             cut_score=previous.cut_score,
+            transition_type=previous.transition_type,
         )
         segments.pop()
 
-    # Renumber after any merge so the manifest contains contiguous IDs.
     return [
         SceneSegment(
             scene_id=f"scene_{position:03d}",
@@ -170,6 +219,7 @@ def detect_scenes(
             end_frame=segment.end_frame,
             cut_before=segment.cut_before,
             cut_score=segment.cut_score,
+            transition_type=segment.transition_type,
         )
         for position, segment in enumerate(segments, start=1)
     ]

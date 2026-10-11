@@ -62,6 +62,25 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual(len(scenes), 1)
         self.assertEqual((scenes[0].start_frame, scenes[0].end_frame), (0, 5))
 
+    def test_detects_gradual_dissolve_and_marks_new_anchor(self):
+        rng = np.random.default_rng(3)
+        first = np.empty((64, 96, 3), dtype=np.uint8)
+        first[:] = (40, 80, 140)
+        first = cv2.add(first, rng.integers(0, 20, size=first.shape, dtype=np.uint8))
+        second = np.empty((64, 96, 3), dtype=np.uint8)
+        second[:] = (180, 30, 20)
+        second = cv2.add(second, rng.integers(0, 20, size=second.shape, dtype=np.uint8))
+        frames = [
+            (index, ((1 - index / 5) * first + (index / 5) * second).astype(np.uint8))
+            for index in range(6)
+        ]
+
+        scenes = detect_scenes(frames)
+
+        self.assertEqual([(scene.start_frame, scene.end_frame) for scene in scenes], [(0, 2), (3, 5)])
+        self.assertEqual(scenes[1].transition_type, "dissolve")
+        self.assertEqual(scenes[1].cut_before, 3)
+
     def test_empty_and_single_frame_inputs_have_defined_results(self):
         self.assertEqual(detect_scenes([]), [])
         self.assertEqual(

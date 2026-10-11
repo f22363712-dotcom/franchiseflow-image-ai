@@ -622,6 +622,7 @@ def _scene_plan_entry(
         "end_frame": int(scene["end_frame"]),
         "cut_before": scene.get("cut_before"),
         "cut_score": float(scene.get("cut_score", 0.0)),
+        "transition_type": str(scene.get("transition_type", "none")),
         "surfaces": normalized_surfaces,
     }
 
@@ -644,6 +645,7 @@ def _scene_view(
         "end_frame": int(scene["end_frame"]),
         "cut_before": scene.get("cut_before"),
         "cut_score": float(scene.get("cut_score", 0.0)),
+        "transition_type": str(scene.get("transition_type", "none")),
         "status": status,
         "initialization_mode": mode,
         "preview": sample_preview,

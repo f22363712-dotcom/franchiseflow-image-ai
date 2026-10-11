@@ -421,6 +421,7 @@ def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
             "scene_id": scene_id,
             "start_frame": start,
             "end_frame": end,
+            "transition_type": str(scene.get("transition_type", "none")),
             "surfaces": normalized_surfaces,
         })
         previous_end = end
@@ -592,6 +593,7 @@ def run_tracker(
             "scene_id": scene["scene_id"],
             "start_frame": scene["start_frame"],
             "end_frame": scene["end_frame"],
+            "transition_type": scene.get("transition_type", "none"),
             "surface_ids": [surface["surface_id"] for surface in scene["surfaces"]],
             "failed_frames": 0,
             "surface_failures": {surface["surface_id"]: 0 for surface in scene["surfaces"]},
@@ -813,6 +815,7 @@ def run_tracker(
             "scene_id": item["scene_id"],
             "start_frame": item["start_frame"],
             "end_frame": item["end_frame"],
+            "transition_type": item.get("transition_type", "none"),
             "surface_ids": item["surface_ids"],
             "failed_frames": item["failed_frames"],
             "surface_failures": [
@@ -827,6 +830,7 @@ def run_tracker(
             "scene_id": "scene_001",
             "start_frame": 0,
             "end_frame": max(0, index - 1),
+            "transition_type": "none",
             "surface_ids": [f"surface_{position:03d}" for position in range(1, surface_count + 1)],
             "failed_frames": sum(1 for record in records if record.get("status") != "ok"),
             "surface_failures": [],
