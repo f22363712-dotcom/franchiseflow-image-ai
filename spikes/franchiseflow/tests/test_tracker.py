@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tracker import PlanarTracker, composite, main, project_quad, run_tracker
+from tracker import PlanarTracker, composite, main, project_quad, run_tracker, _normalize_scene_plan
 
 
 def _create_textured_image(width=640, height=480):
@@ -337,6 +337,24 @@ class TrackerSyntheticTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "contiguous"):
             run_tracker(video_path, quad, signs[:1], self.temp_dir / "invalid_scene_out", scene_plan=scene_plan)
+
+    def test_scene_plan_accepts_three_scenes_and_rejects_nine(self):
+        quad = [[100, 100], [300, 100], [300, 250], [100, 250]]
+        scenes = [
+            {"scene_id": f"scene_{index + 1:03d}", "start_frame": index * 2, "end_frame": index * 2 + 1,
+             "surfaces": [{"surface_id": f"surface_{index + 1:03d}", "quad": quad}]}
+            for index in range(3)
+        ]
+        normalized = _normalize_scene_plan(scenes)
+        self.assertEqual(len(normalized), 3)
+        self.assertEqual(normalized[-1]["end_frame"], 5)
+        too_many = [
+            {"scene_id": f"scene_{index:03d}", "start_frame": index - 1, "end_frame": index - 1,
+             "surfaces": [{"surface_id": f"surface_{index:03d}", "quad": quad}]}
+            for index in range(1, 10)
+        ]
+        with self.assertRaisesRegex(ValueError, "between 1 and 8 scenes"):
+            _normalize_scene_plan(too_many)
 
     @patch("tracker.run_tracker", return_value={"branch_count": 1})
     def test_cli_accepts_one_sign_asset(self, run_mock):

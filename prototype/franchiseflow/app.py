@@ -46,7 +46,12 @@ ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 MAX_BRANCHES = 10
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
-MAX_VIDEO_SECONDS = 15.0
+# Processing budgets are deliberately explicit.  They keep the local worker
+# bounded while allowing real brand shoots with several hard-cut shots.  A
+# caller can still tighten either budget in a deployment or test by replacing
+# these module constants before submitting work.
+MAX_VIDEO_SECONDS = 60.0
+MAX_SCENES = 8
 MAX_ACTIVE_JOBS = 4
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_IMAGE_PIXELS = 20_000_000
@@ -734,7 +739,7 @@ def _process_job(job_id: str) -> None:
         job["phase"] = "sampling"
         _set_job(job)
         video_path, sign_paths, output_dir = _paths(job)
-        detected_scenes = sample_video_scenes(video_path, max_scenes=2)
+        detected_scenes = sample_video_scenes(video_path, max_scenes=MAX_SCENES)
         samples = detected_scenes[0]["samples"]
         sample_dir = output_dir / "samples"
         manual_quad = job.get("manual_quad")

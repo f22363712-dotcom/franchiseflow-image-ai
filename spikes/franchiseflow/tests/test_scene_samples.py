@@ -63,6 +63,17 @@ class SceneSamplingTests(unittest.TestCase):
         self.assertEqual([index for index, _ in scenes[1]["samples"]], [2, 3])
         self.assertEqual([scene["cut_before"] for scene in scenes], [None, 2])
 
+    def test_three_hard_cut_scenes_are_preserved_with_eight_scene_budget(self):
+        colours = [(20, 50, 100), (180, 220, 30), (30, 180, 220)]
+        frames = [np.full((48, 80, 3), colour, dtype=np.uint8) for colour in colours for _ in range(2)]
+        path = self.temp_dir / "three_scenes.mp4"
+        _write_video(path, frames)
+
+        scenes = sample_video_scenes(path, max_scenes=8)
+
+        self.assertEqual(len(scenes), 3)
+        self.assertEqual([(scene["start_frame"], scene["end_frame"]) for scene in scenes], [(0, 1), (2, 3), (4, 5)])
+
     def test_rejects_video_with_more_scenes_than_allowed(self):
         colours = [
             (20, 50, 100),
@@ -75,6 +86,19 @@ class SceneSamplingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"exceeds max_scenes=2"):
             sample_video_scenes(path, max_scenes=2)
+
+    def test_rejects_nine_scenes_with_eight_scene_budget(self):
+        colours = [
+            (20, 50, 100), (180, 220, 30), (30, 180, 220),
+            (220, 40, 80), (40, 220, 100), (100, 40, 220),
+            (220, 160, 20), (20, 180, 160), (160, 20, 180),
+        ]
+        frames = [np.full((48, 80, 3), colour, dtype=np.uint8) for colour in colours for _ in range(2)]
+        path = self.temp_dir / "nine_scenes.mp4"
+        _write_video(path, frames)
+
+        with self.assertRaisesRegex(ValueError, r"exceeds max_scenes=8"):
+            sample_video_scenes(path, max_scenes=8)
 
     def test_rejects_missing_video(self):
         with self.assertRaisesRegex(ValueError, "does not exist"):

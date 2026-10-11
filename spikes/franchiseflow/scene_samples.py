@@ -41,13 +41,16 @@ def _sample_indices(segment: SceneSegment) -> tuple[int, ...]:
     return tuple(sorted({segment.start_frame, middle, segment.end_frame}))
 
 
-def sample_video_scenes(video_path: str | Path, *, max_scenes: int = 2) -> list[dict[str, Any]]:
+def sample_video_scenes(video_path: str | Path, *, max_scenes: int = 8) -> list[dict[str, Any]]:
     """Detect hard-cut scenes and return original-resolution keyframes.
 
     ``samples`` contains ``(global_frame_index, BGR_frame)`` tuples. Scene
     bounds are inclusive. The decoder never trusts ``CAP_PROP_FRAME_COUNT``;
     ``total_frames`` is the exact number of frames successfully read during
-    the first pass.
+    the first pass. ``max_scenes`` is an explicit safety budget for hard-cut
+    segmentation. The web product supplies its own configured limit; callers
+    using this lower-level helper can choose a smaller budget for lightweight
+    jobs.
     """
     path = Path(video_path)
     if not path.exists():

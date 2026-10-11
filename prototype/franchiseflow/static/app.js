@@ -318,7 +318,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function setupSceneReview(job) {
-    reviewScenes = Array.isArray(job.scenes) ? job.scenes.slice(0, 2) : [];
+    // The backend caps detection at eight hard-cut scenes. Keep every scene
+    // in the review picker so a later shot cannot silently disappear from the
+    // submitted scene plan.
+    reviewScenes = Array.isArray(job.scenes) ? job.scenes.slice(0, 8) : [];
     sceneQuads.clear();
     sceneSurfaces.clear();
     activeSceneId = null;
