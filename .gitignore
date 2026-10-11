@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+
+# FranchiseFlow generated media and temporary probes
+spikes/franchiseflow/outputs*/
+spikes/franchiseflow/out_actual/
+spikes/franchiseflow/_tmp_test/
+spikes/franchiseflow/fixtures/grid.jpg
+
+# Local prototype artifacts from earlier experiments
+prototype/adsafezone/uploads/
+prototype/adsafezone/outputs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
