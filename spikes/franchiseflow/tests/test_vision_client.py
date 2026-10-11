@@ -59,9 +59,10 @@ class VisionClientParsingTests(unittest.TestCase):
                 return json.dumps(payload).encode()
 
         with patch("vision_client.urllib.request.urlopen", return_value=FakeResponse()):
-            result = VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_sign(b"jpeg", 1000, 500)
+            result = VisionClient(api_key="test-key", base_url="https://example.test/v1", model="GLM-5.3-flash").locate_sign(b"jpeg", 1000, 500)
         self.assertEqual(result["quad"][2], [900.0, 250.0])
         self.assertEqual(result["model"], "GLM-5.3-flash")
+
 
     def test_raises_on_http_403_without_leaking_body(self):
         secret_body = b'{"error": {"message": "upstream_secret_token_12345"}}'
