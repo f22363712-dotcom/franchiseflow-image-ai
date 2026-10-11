@@ -96,7 +96,7 @@ python prototype/franchiseflow/app.py
 - 批次中的 `failed` 或 `vision_failed` 子任务会显示“重试此视频”。重试沿用原任务 ID、视频和分店素材，清除旧输出后重新进入队列；队列满或存储异常会恢复原失败状态和产物。
 - 批次交付可以调用 `GET /api/batches/<batch_id>/download` 获取 ZIP。根目录 `batch_manifest.json` 列出所有子任务及状态；只有已完成且文件路径校验通过的任务才会包含 `jobs/<job_id>/manifest.json`、MP4 和 SHA-256/字节数清单。未完成、失败、人工复核或缺少成片的任务只保留状态，不会进入视频目录；没有任何可交付子任务时接口返回 409。
 - 服务重启恢复时会扫描带有 `batch_id` 的持久化子任务，把进程在 `job.json` 已落盘、批次索引尚未追加的窗口中留下的子任务补回 `job_ids`。没有 `batch_id` 的普通单任务，以及批次文件已经删除的任务，不会被误加入批次。
-- `POST /api/jobs` 和 `POST /api/batches` 支持可选的 `Idempotency-Key` 请求头。同一接口、同一 key 和相同表单/文件内容会返回原来的资源，不会创建重复任务；同一接口复用 key 但请求内容变化会返回 HTTP 409。不带该请求头时保持原有行为。key、请求指纹和资源 ID 写入 `prototype/franchiseflow/outputs/idempotency.json`，原子替换保存，服务重启后仍可恢复；当前实现使用单进程锁，多副本部署需换共享存储与分布式锁。
+- `POST /api/jobs` 和 `POST /api/batches` 支持可选的 `Idempotency-Key` 请求头。同一接口、同一 key 和相同表单/文件内容会返回原来的资源，不会创建重复任务；同一接口复用 key 但请求内容变化会返回 HTTP 409。不带该请求头时保持原有行为。key、请求指纹和资源 ID 写入 `prototype/franchiseflow/outputs/idempotency.json`，原子替换保存，服务重启后仍可恢复；索引损坏或不可读时返回 HTTP 507 并停止创建；资源创建与索引落盘之间仍有进程崩溃窗口，不宣称跨进程 exactly-once；当前实现使用单进程锁，多副本部署需换共享存储与分布式锁。
 
 ### 4.2 运行全量自动化测试
 ```powershell

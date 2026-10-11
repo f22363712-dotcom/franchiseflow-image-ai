@@ -374,6 +374,36 @@ class FranchiseFlowAppTests(unittest.TestCase):
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
 
+    def test_corrupt_idempotency_state_fails_closed_before_creating_job_or_batch(self):
+        import app as app_module
+
+        job_data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch.object(app_module.IDEMPOTENCY_STORE, "get", side_effect=RuntimeError("corrupt index")):
+            with patch.object(app_module, "_submit_job") as submit:
+                job_response = self.client.post(
+                    "/api/jobs",
+                    data=job_data,
+                    headers={"Idempotency-Key": f"corrupt-job-{uuid.uuid4().hex}"},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(job_response.status_code, 507)
+            self.assertIn("idempotency state unavailable", job_response.get_json()["error"])
+            submit.assert_not_called()
+
+            with patch.object(app_module, "_create_batch_endpoint_impl") as create_batch:
+                batch_response = self.client.post(
+                    "/api/batches",
+                    data={"brand_profile_id": "missing", "videos": (_make_dummy_mp4(), "video.mp4")},
+                    headers={"Idempotency-Key": f"corrupt-batch-{uuid.uuid4().hex}"},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(batch_response.status_code, 507)
+            self.assertIn("idempotency state unavailable", batch_response.get_json()["error"])
+            create_batch.assert_not_called()
+
     def test_brand_profile_can_be_created_and_listed(self):
         profile_id = f"test_brand_{uuid.uuid4().hex[:8]}"
         data = {

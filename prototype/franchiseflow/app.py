@@ -1625,6 +1625,11 @@ def create_batch_endpoint():
             return jsonify({"error": str(exc)}), 409
         except IdempotencyError as exc:
             return jsonify({"error": str(exc)}), 409
+        except RuntimeError as exc:
+            # A corrupt or unreadable index must fail closed. Creating a new
+            # batch here would turn a recoverable storage incident into a
+            # duplicate submission on the next client retry.
+            return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
         if replay is not None:
             resource, status_code = replay
             return jsonify(resource), status_code
@@ -1745,6 +1750,11 @@ def create_job_endpoint():
             return jsonify({"error": str(exc)}), 409
         except IdempotencyError as exc:
             return jsonify({"error": str(exc)}), 409
+        except RuntimeError as exc:
+            # A corrupt or unreadable index must fail closed. Creating a new
+            # job here would turn a recoverable storage incident into a
+            # duplicate submission on the next client retry.
+            return jsonify({"error": f"idempotency state unavailable: {exc}"}), 507
         if replay is not None:
             resource, status_code = replay
             return jsonify(resource), status_code
