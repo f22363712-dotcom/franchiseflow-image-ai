@@ -80,9 +80,17 @@ class InputMediaTests(unittest.TestCase):
         with patch("input_media.probe_video_codec", return_value={"codec_name": "hevc", "pix_fmt": "yuv420p"}):
             self.assertTrue(source_requires_normalization(self.temp_dir / "phone.mp4"))
 
+    def test_mp4_with_unknown_codec_requires_normalization(self):
+        with patch("input_media.probe_video_codec", return_value={}):
+            self.assertTrue(source_requires_normalization(self.temp_dir / "unknown.mp4"))
+
     def test_mp4_with_supported_codec_keeps_legacy_path(self):
         with patch("input_media.probe_video_codec", return_value={"codec_name": "mpeg4", "pix_fmt": "yuv420p"}):
             self.assertFalse(source_requires_normalization(self.temp_dir / "fixture.mp4"))
+
+    def test_mp4_with_non_browser_pixel_format_requires_normalization(self):
+        with patch("input_media.probe_video_codec", return_value={"codec_name": "h264", "pix_fmt": "yuv444p"}):
+            self.assertTrue(source_requires_normalization(self.temp_dir / "wide_color.mp4"))
 
 
 if __name__ == "__main__":

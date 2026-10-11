@@ -3,8 +3,9 @@
 > **编写时间**：2026-10-12 01:10（北京时间）  
 > **提交截止**：2026-10-12 12:00（Banana Hacks 黑客松）  
 > **当前状态**：核心四个阶段任务（Task 1–4）全部实现并通过回归测试，代码已同步推至 GitHub `master` 分支。  
+> **文档性质**：这是早期黑客松交接记录。下面的“三张素材、三路全自动”描述只适用于当时的单平面样片，当前产品契约以仓库根目录 `README.md`、任务 `manifest.json` 和页面人工复核状态为准。
 > **仓库地址**：[https://github.com/f22363712-dotcom/franchiseflow-image-ai.git](https://github.com/f22363712-dotcom/franchiseflow-image-ai.git)  
-> **基线与最新提交**：从 `9982ac3` 出发，当前最新提交为 `1d3ae19`。
+> **基线与最新提交**：从 `9982ac3` 出发，当前远程基线为 `d09960b`；本页早期提交号仅作历史参考。
 
 ---
 
@@ -14,7 +15,7 @@
 实体连锁加盟品牌（餐饮、零售、便利店等）通常只有总部拍摄的一条高质量移动实拍视频。当需要为数十家加盟分店制作本地化广告投放素材时，传统后期（AE/PR）需要逐帧打关键帧和透视对齐，耗费数小时。
 
 ### 1.2 FranchiseFlow 解决方案
-**一条移动门店实拍视频 + 三张分店招牌图 → 全自动导出三路独立透视贴合 MP4 视频**。
+**一条移动门店实拍视频 + 分店招牌图 → 生成多路独立透视贴合 MP4 视频**。候选平面经过验证后自动跟踪，存在歧义时需要人工确认。
 
 ### 1.3 核心技术链路（Hybrid AI + Classical CV）
 ```
@@ -38,7 +39,7 @@
 ```
 
 **为什么是混合架构而不是逐帧大模型？**
-1. **彻底消除抖动（Zero Jitter）**：多模态大模型每帧独立推理会导致角点坐标出现 3~10 像素随机漂移，产生剧烈闪烁；传统几何跟踪物理级平滑。
+1. **避免逐帧模型坐标漂移**：多模态大模型只提出首帧候选，后续帧由固定锚点的几何跟踪器处理，减少独立推理带来的坐标跳动。
 2. **极低成本与零排队**：长视频逐帧调用多模态 API 成本极高且受网络波动制约；本方案只需调用 1 次模型，后续全部在本地毫秒级纯数学解算。
 
 ---
@@ -55,7 +56,7 @@
 | `prototype/franchiseflow/templates/index.html` | 前端界面（黑客松深色玻璃拟态美学） | Canvas 招牌四角投影、指标仪表盘、三路视频同步播放卡片 |
 | `prototype/franchiseflow/static/app.js`, `app.css` | 前端交互与样式 | 拖拽上传、异步状态轮询、角点可视化标注、播放控制 |
 | `spikes/franchiseflow/tests/` | 跟踪算法与视觉客户端单元测试 | 14 项测试：已知单应矩阵测试、退化拦截、403脱敏拦截等 |
-| `prototype/franchiseflow/tests/` | Web 端到端单元测试 | 6 项测试：参数校验、网关异常拦截、Mock流水线等 |
+| `prototype/franchiseflow/tests/` | Web 端到端单元测试 | 覆盖参数校验、网关异常拦截、Mock 流水线、人工复核和任务恢复 |
 | `spikes/franchiseflow/fixtures/` | 真实基准视频与剪辑版本 | `real_storefront.mp4` (Pexels 9.7s)、`demo_cut.mp4` (6.0s无遮挡版) |
 | `docs/` | 文档与交付件 | `FranchiseFlow_Demo脚本.md`（<=3分钟录屏脚本）、`FranchiseFlow_API接入记录.md`、`FranchiseFlow_代码审查报告.md` |
 
@@ -73,7 +74,7 @@
    - **实测结果**：使用 `gemini-3.1-flash-image` 对 `real_storefront_first.jpg` 成功输出高精度的四角坐标 `[[0, 103], [760, 497], [803, 706], [0, 240]]` 与空间几何推理理由。
    - 代入真实视频：首帧提取 SIFT 点 **475 个**，中位内点 **288 个**，重投影残差中位数 **0.30 px**，**0 失败帧**！
 3. **离线兜底机制（Manual Fallback）**：  
-   - 当完全无网络或云端超时，支持读取 `quad.json`（带有显式 `manual_fallback` 标签），保证演示 100% 不翻车。
+  - 当完全无网络或云端超时，支持读取 `quad.json`（带有显式 `manual_fallback` 标签），用于离线人工基线演示。
 
 ---
 
@@ -87,14 +88,14 @@ python prototype/franchiseflow/app.py
 - 输入：
   - 视频：`spikes/franchiseflow/fixtures/real_storefront.mp4`（或 `demo_cut.mp4`）
   - 分支素材：`spikes/franchiseflow/assets/` 下的三张图片（`riverside.png`、`downtown.png`、`northpark.png`）
-- 模式：可选“视觉模型模式”或“手动基线兜底”。
+- 模式：可选“视觉模型模式”或“手动基线兜底”。任务列表可通过 `GET /api/jobs?status=needs_review` 找回待复核作业。
 
 ### 4.2 运行全量自动化测试
 ```powershell
 python -m unittest discover -s spikes/franchiseflow/tests -v
 python -m unittest discover -s prototype/franchiseflow/tests -v
 ```
-（当前全量 20 项测试均已通过）
+（当前两套测试均已通过，具体数量以命令输出为准）
 
 ### 4.3 零泄密与格式检查
 ```powershell
@@ -109,7 +110,7 @@ git grep -n -I -E 'sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}' --
 1. **前景物体遮挡（Occlusion Handling）**：
    - 在 9.7 秒完整视频的第 155 至 161 帧（约 3.0%），因行人前景横穿招牌，导致特征点被遮挡。
    - 当前处理方式：**安全回退保留原画（Fail-Safe）**，不渲染悬浮错位贴图。
-   - 现成方案：已准备 6.0 秒干净运镜版本 `spikes/franchiseflow/fixtures/demo_cut.mp4`（144 帧），在演示无遮挡运镜时贴合率 100%；完整片段作为压力测试保留。
+   - 现成方案：已准备 6.0 秒干净运镜版本 `spikes/franchiseflow/fixtures/demo_cut.mp4`（144 帧），用于演示无遮挡运镜；完整片段作为压力测试保留。
 2. **CPU 渲染时长**：
    - 720p 完整 233 帧逐帧进行 SIFT 特征检测与单应变换在纯 CPU 上耗时约 60~100 秒。Web 界面有 Loading 状态展示，适合单次异步渲染，不适合毫秒级实时交互。
 
@@ -121,7 +122,7 @@ git grep -n -I -E 'sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}' --
 
 ### 决策点 1：下一步重点是“工程精进”还是“准备最终提交材料与录屏”？
 - **选项 A（强烈建议）：转向演示录屏与材料打磨**
-  - 当前代码已经具备：在线视觉大模型定位、高质量 SIFT 几何跟踪、三路视频渲染导出、高美感 Web 界面、完善单测、全套文档与 <= 3 分钟录屏脚本。
+  - 当前代码已经具备：在线视觉大模型候选定位、SIFT 几何跟踪、多路视频渲染导出、任务状态与人工复核页面、回归测试和 <= 3 分钟录屏脚本。多场景、多平面任务需要提交明确的 `asset_bindings`。
   - 接下来的最大产出是：指导用户完成 1080p 录屏（不超过 180 秒）、上传 YouTube/Bilibili、撰写 Devpost 提交描述（解决的痛点、技术链路、创新性、署名）。
 - **选项 B：微调级算法视觉增强（若时间充裕）**
   - 是否需要在合成边缘增加 1~2 像素高斯模糊羽化（Feathering）以进一步提升招牌融合自然度？

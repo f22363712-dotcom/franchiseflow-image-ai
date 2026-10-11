@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from candidate_validator import validate_candidate
 from job_store import create_job, load_job, save_job
-from tracker import parse_quad, run_tracker
+from tracker import _normalize_asset_bindings, parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from vision_client import VisionClient
 from input_media import (
@@ -139,6 +139,33 @@ def _job(job_id: str) -> dict[str, Any] | None:
     if job is not None:
         JOBS[job_id] = job
     return job
+
+
+def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
+    """Read durable job summaries so review work survives a browser restart."""
+    limit = max(1, min(int(limit), 100))
+    jobs: list[dict[str, Any]] = []
+    for state_path in OUTPUT_DIR.glob("*/job.json"):
+        try:
+            job = load_job(OUTPUT_DIR, state_path.parent.name)
+        except (ValueError, RuntimeError, OSError):
+            continue
+        if not job or (status and job.get("status") != status):
+            continue
+        jobs.append({
+            "job_id": job.get("job_id", state_path.parent.name),
+            "status": job.get("status"),
+            "phase": job.get("phase"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "branch_count": job.get("branch_count"),
+            "scene_count": len(job.get("scenes", [])) if isinstance(job.get("scenes"), list) else None,
+            "initialization_mode": job.get("initialization_mode"),
+            "error": job.get("error"),
+            "outputs": job.get("outputs", []),
+        })
+    jobs.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return jobs[:limit]
 
 
 def _active_future_count() -> int:
@@ -715,19 +742,13 @@ def _review_surfaces_for_scene(
 
 
 def _derive_asset_bindings(scene_plan: list[dict[str, Any]], branch_count: int) -> list[dict[str, Any]] | None:
-    """Derive the legacy-safe mapping when every branch targets every plane."""
+    """Keep the single-surface legacy mapping for callers outside the worker."""
     counts = [len(scene.get("surfaces", [])) for scene in scene_plan]
     if not counts or max(counts, default=1) <= 1:
         return None
-    surface_ids = [surface["surface_id"] for scene in scene_plan for surface in scene.get("surfaces", [])]
-    return [
-        {
-            "branch_index": branch_index,
-            "surface_ids": surface_ids,
-            "fit": "cover",
-        }
-        for branch_index in range(1, branch_count + 1)
-    ]
+    # Multi-surface jobs must be explicit. Returning an all-surfaces mapping
+    # here used to hide an ambiguous semantic choice from the operator.
+    return None
 
 
 def _process_job(job_id: str) -> None:
@@ -751,6 +772,8 @@ def _process_job(job_id: str) -> None:
         if manual_quad is not None and not (job.get("scene_plan") and job.get("initialization_mode") == "reviewed_candidate"):
             quad = parse_quad(manual_quad)
             mode = job.get("initialization_mode", "manual_fallback")
+            if len(detected_scenes) > 1:
+                raise ValueError("manual fallback currently supports one hard-cut scene; use vision review for multi-scene video")
             for scene in detected_scenes:
                 scene_dir = sample_dir / scene["scene_id"]
                 _save_contact_sheet(scene["samples"], scene_dir)
@@ -821,9 +844,27 @@ def _process_job(job_id: str) -> None:
             "sample_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/first.jpg",
             "contact_sheet_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/contact_sheet.jpg",
         })
-        asset_bindings = job.get("asset_bindings") or _derive_asset_bindings(scene_plan or [], len(sign_paths))
-        if asset_bindings is not None:
-            job["asset_bindings"] = asset_bindings
+        surface_ids = [surface["surface_id"] for scene in (scene_plan or []) for surface in scene.get("surfaces", [])]
+        requires_explicit_bindings = any(len(scene.get("surfaces", [])) > 1 for scene in (scene_plan or []))
+        try:
+            asset_bindings = _normalize_asset_bindings(
+                job.get("asset_bindings"),
+                len(sign_paths),
+                surface_ids,
+                require_explicit=requires_explicit_bindings,
+            )
+        except ValueError as exc:
+            if requires_explicit_bindings and job.get("asset_bindings") is None:
+                job.update({
+                    "status": "needs_review",
+                    "phase": "human_review",
+                    "error": str(exc),
+                    "asset_bindings_required": True,
+                })
+                _set_job(job)
+                return
+            raise
+        job["asset_bindings"] = asset_bindings
         _set_job(job)
 
         job["phase"] = "tracking"
@@ -929,6 +970,19 @@ def create_job_endpoint():
         return jsonify({"error": str(exc)}), 429
 
 
+@app.route("/api/jobs", methods=["GET"])
+def list_jobs_endpoint():
+    raw_limit = request.args.get("limit", "20")
+    status = request.args.get("status") or None
+    if status is not None and status not in {"queued", "running", "needs_review", "completed", "failed", "vision_failed"}:
+        return jsonify({"error": "unsupported job status filter"}), 400
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return jsonify({"error": "limit must be an integer"}), 400
+    return jsonify({"jobs": _list_jobs(limit=limit, status=status)})
+
+
 @app.route("/api/jobs/<job_id>", methods=["GET"])
 def get_job(job_id: str):
     job = _job(job_id)
@@ -981,10 +1035,39 @@ def review_job(job_id: str):
                 raise ValueError("review quad lies outside the first frame")
     except (ValueError, TypeError, cv2.error) as exc:
         return jsonify({"error": f"Invalid review quad: {exc}"}), 400
+    if reviewed_plan is not None:
+        surface_ids = [surface["surface_id"] for scene in reviewed_plan for surface in scene.get("surfaces", [])]
+        requires_explicit_bindings = any(len(scene.get("surfaces", [])) > 1 for scene in reviewed_plan)
+        try:
+            normalized_bindings = _normalize_asset_bindings(
+                requested_asset_bindings,
+                int(job.get("branch_count") or len(job.get("branch_files", []))),
+                surface_ids,
+                require_explicit=requires_explicit_bindings,
+            )
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid asset_bindings: {exc}"}), 400
+    else:
+        if requested_asset_bindings is not None:
+            existing_plan = job.get("scene_plan") or []
+            surface_ids = [surface["surface_id"] for scene in existing_plan for surface in scene.get("surfaces", [])]
+            if not surface_ids:
+                surface_ids = ["surface_001"]
+            try:
+                normalized_bindings = _normalize_asset_bindings(
+                    requested_asset_bindings,
+                    int(job.get("branch_count") or len(job.get("branch_files", []))),
+                    surface_ids,
+                    require_explicit=any(len(scene.get("surfaces", [])) > 1 for scene in existing_plan),
+                )
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid asset_bindings: {exc}"}), 400
+        else:
+            normalized_bindings = None
     previous = dict(job)
     job.update({"status": "queued", "phase": "queued", "initialization_mode": "reviewed_candidate", "manual_quad": quad.round(3).tolist(), "reviewed_quad": quad.round(3).tolist()})
-    if requested_asset_bindings is not None:
-        job["asset_bindings"] = requested_asset_bindings
+    if normalized_bindings is not None:
+        job["asset_bindings"] = normalized_bindings
     if reviewed_plan is not None:
         job["scene_plan"] = reviewed_plan
         job["scenes"] = [{**scene, "status": "validated", "initialization_mode": "reviewed_candidate", "surfaces": plan["surfaces"]}
@@ -1024,7 +1107,12 @@ def render_job():
         _release_sync_slot()
     if job.get("status") != "completed":
         code = 502 if "HTTP 401" in job.get("error", "") or "HTTP 403" in job.get("error", "") else 500
-        return jsonify({"error": job.get("error", "render failed"), "status": job.get("status")}), code
+        return jsonify({
+            "error": job.get("error", "render failed"),
+            "status": job.get("status"),
+            "job_id": job.get("job_id"),
+            "review_url": f"/api/jobs/{job['job_id']}/review" if job.get("status") == "needs_review" else None,
+        }), code
     return jsonify({
         "job_id": job["job_id"],
         "status": job["status"],

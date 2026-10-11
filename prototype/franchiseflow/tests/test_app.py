@@ -217,6 +217,26 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
 
+    def test_list_jobs_reads_persisted_review_state(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "needs_review", "phase": "human_review", "error": "candidate requires review"})
+        save_job(OUTPUT_DIR, job_id, job)
+        response = self.client.get("/api/jobs?status=needs_review&limit=5")
+        self.assertEqual(response.status_code, 200)
+        listed = response.get_json()["jobs"]
+        self.assertTrue(any(item["job_id"] == job_id and item["status"] == "needs_review" for item in listed))
+
+    def test_list_jobs_rejects_invalid_filter(self):
+        response = self.client.get("/api/jobs?status=unknown")
+        self.assertEqual(response.status_code, 400)
+
     def test_create_job_normalizes_mov_source_and_keeps_original_name(self):
         data = {
             "video": (_make_dummy_mp4(), "phone_capture.mov"),
@@ -291,6 +311,10 @@ class FranchiseFlowAppTests(unittest.TestCase):
         data = {
             "video": (_make_two_scene_mp4(), "video.mp4"),
             "branches": [(_make_dummy_image("b1"), "b1.png"), (_make_dummy_image("b2"), "b2.png")],
+            "asset_bindings": json.dumps([
+                {"branch_index": 1, "surface_ids": ["scene_001_surface_001", "scene_001_surface_002", "scene_002_surface_001", "scene_002_surface_002"], "fit": "cover"},
+                {"branch_index": 2, "surface_ids": ["scene_001_surface_001", "scene_001_surface_002", "scene_002_surface_001", "scene_002_surface_002"], "fit": "cover"},
+            ]),
         }
         candidates = [
             {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9, "reason": "front"},
@@ -319,6 +343,31 @@ class FranchiseFlowAppTests(unittest.TestCase):
             ["scene_002_surface_001", "scene_002_surface_002"],
         )
         self.assertEqual(response.get_json()["summary"]["surface_count"], 4)
+
+    def test_multi_surface_auto_job_requires_explicit_bindings(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png"), (_make_dummy_image("b2"), "b2.png")],
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [
+                {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9},
+                {"quad": [[140, 20], [220, 20], [220, 80], [140, 80]], "confidence": 0.8},
+            ],
+        }
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        with patch("app.VisionClient", return_value=mock_instance), \
+             patch("app.validate_candidate", return_value=accepted), \
+             patch("app.run_tracker") as tracker:
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 500)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "needs_review")
+        self.assertIn("asset_bindings", payload["error"])
+        self.assertIsNotNone(payload["job_id"])
+        tracker.assert_not_called()
 
     def test_overlapping_candidates_require_review_for_every_scene(self):
         data = {
@@ -403,6 +452,31 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("overlap", response.get_json()["error"].lower())
 
+    def test_review_rejects_multi_surface_without_bindings(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({
+            "status": "needs_review",
+            "scenes": [{"scene_id": "scene_001", "start_frame": 0, "end_frame": 1, "status": "needs_review"}],
+        })
+        save_job(OUTPUT_DIR, job_id, job)
+        payload = {"scenes": [{
+            "scene_id": "scene_001",
+            "surfaces": [
+                {"surface_id": "front_panel", "quad": [[20, 20], [100, 20], [100, 80], [20, 80]]},
+                {"surface_id": "side_panel", "quad": [[140, 20], [220, 20], [220, 80], [140, 80]]},
+            ],
+        }]}
+        response = self.client.post(f"/api/jobs/{job_id}/review", json=payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("asset_bindings", response.get_json()["error"])
+
     def test_scene_review_state_is_persisted_before_worker_returns(self):
         data = {
             "video": (_make_dummy_mp4(), "video.mp4"),
@@ -445,6 +519,29 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(res.status_code, 202)
         self.assertEqual(res.get_json()["initialization_mode"], "reviewed_candidate")
         submit.assert_called_once_with(job_id)
+
+    def test_review_rejects_unknown_asset_binding_before_queueing(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({"status": "needs_review", "candidate": {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]]}})
+        save_job(OUTPUT_DIR, job_id, job)
+        with patch("app._submit_job") as submit:
+            response = self.client.post(
+                f"/api/jobs/{job_id}/review",
+                json={
+                    "quad": [[20, 20], [100, 20], [100, 80], [20, 80]],
+                    "asset_bindings": [{"branch_index": 1, "surface_ids": ["unknown_surface"], "fit": "cover"}],
+                },
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unknown surface", response.get_json()["error"].lower())
+        submit.assert_not_called()
 
     def test_review_queue_full_keeps_job_reviewable(self):
         data = {

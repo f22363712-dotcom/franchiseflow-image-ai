@@ -66,8 +66,18 @@ def source_requires_normalization(path: str | Path) -> bool:
     source = Path(path)
     if source.suffix.lower() != ".mp4":
         return True
-    codec = probe_video_codec(source).get("codec_name", "").lower()
-    return codec in CODECS_REQUIRING_NORMALIZATION
+    # An unknown codec is unsafe to pass directly to OpenCV.  This includes a
+    # missing ffprobe binary, a malformed probe response, and an unreadable
+    # stream.  Normalizing may cost one extra encode, but it avoids silently
+    # sending HEVC/AV1 MP4 files down a decoder-dependent path.
+    probe = probe_video_codec(source)
+    codec = probe.get("codec_name", "").lower()
+    pixel_format = probe.get("pix_fmt", "").lower()
+    return (
+        not codec
+        or codec in CODECS_REQUIRING_NORMALIZATION
+        or (bool(pixel_format) and pixel_format not in {"yuv420p", "yuvj420p"})
+    )
 
 
 def inspect_video(path: str | Path) -> dict[str, Any]:

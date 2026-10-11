@@ -37,6 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let activeSceneId = null;
   let activeSurfaceIndex = 0;
   let reviewPreviewUrl = null;
+  let reviewBranchCount = 1;
   const sceneQuads = new Map();
   const sceneSurfaces = new Map();
   let previewRenderToken = 0;
@@ -395,8 +396,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function showReview(job) {
     reviewPanel.hidden = false;
+    reviewBranchCount = Math.max(1, Number(job.branch_count) || 1);
     reviewPreviewUrl = job.sample_preview || job.preview || null;
     const multiScene = setupSceneReview(job);
+    if (job.asset_bindings_required) {
+      reviewReasons.textContent = '检测到多个可替换平面。当前提交会把每个分支素材明确应用到全部已复核平面；需要逐平面分配时请改用 API 的 asset_bindings。';
+    }
     if (multiScene) return;
     if (sceneReviewControls) sceneReviewControls.hidden = true;
     activeSceneId = null;
@@ -513,7 +518,13 @@ document.addEventListener('DOMContentLoaded', () => {
           scene_id: sceneKey(scene),
           surfaces: (sceneSurfaces.get(sceneKey(scene)) || [{ surface_id: `${sceneKey(scene)}_surface_001`, quad: sceneQuads.get(sceneKey(scene)) || centeredQuad() }])
             .map(surface => ({ surface_id: surface.surface_id, quad: surface.quad })),
-        })) }
+        })), asset_bindings: [...sceneSurfaces.values()].flat().map(surface => surface.surface_id).length
+          ? Array.from({ length: reviewBranchCount }, (_, index) => ({
+              branch_index: index + 1,
+              surface_ids: [...sceneSurfaces.values()].flat().map(surface => surface.surface_id),
+              fit: 'cover',
+            }))
+          : undefined }
       : { quad: reviewQuad };
     reviewButton.disabled = true;
     try {
@@ -534,16 +545,33 @@ document.addEventListener('DOMContentLoaded', () => {
       const response = await fetch('/api/demo_results');
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '样片不存在');
-      setStatus('样片就绪', 'badge badge-status');
+      setStatus('样片就绪 · 人工基线', 'badge badge-status');
       updateMetrics(data.summary || {}, data.initialization_mode || 'manual_fallback');
       drawSampleFrame('/static/sample_first_frame.jpg', data.vision_quad);
       renderOutputs(data.outputs || []);
-      btnLoadSample.textContent = '已载入样例';
+      btnLoadSample.textContent = '已载入人工基线样片';
     } catch (error) {
       showError(error);
     }
   });
 
   const savedJobId = localStorage.getItem('franchiseflow_job_id');
-  if (savedJobId) pollJob(savedJobId).catch(showError);
+  if (savedJobId) {
+    pollJob(savedJobId).catch(showError);
+  } else {
+    // A browser refresh can lose localStorage while the durable job JSON still
+    // contains a candidate waiting for review. Offer that latest task back to
+    // the operator instead of forcing a re-upload.
+    fetch('/api/jobs?status=needs_review&limit=1')
+      .then(response => response.ok ? response.json() : { jobs: [] })
+      .then(data => {
+        const latest = Array.isArray(data.jobs) ? data.jobs[0] : null;
+        if (latest && latest.job_id) {
+          localStorage.setItem('franchiseflow_job_id', latest.job_id);
+          return pollJob(latest.job_id);
+        }
+        return null;
+      })
+      .catch(() => null);
+  }
 });
