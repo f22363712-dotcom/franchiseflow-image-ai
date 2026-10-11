@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,17 @@ def save_batch(root: str | Path, batch_id: str, batch: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        # Windows previewers and antivirus scanners can briefly hold the
+        # destination open. Keep the previous durable batch state intact and
+        # retry the atomic swap before surfacing a storage failure.
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     finally:
         try:
             os.unlink(temp_name)

@@ -122,8 +122,12 @@ def build_batch_package(
             if not isinstance(raw_outputs, list) or not raw_outputs:
                 raise BatchPackageError(f"completed child has no output videos: {job_id}")
             artifacts: list[tuple[str, Path, str, int]] = []
+            seen_filenames: set[str] = set()
             for raw_output in raw_outputs:
                 path = _safe_child_file(output_root, job_id, str(raw_output))
+                if path.name in seen_filenames:
+                    raise BatchPackageError(f"duplicate output artifact for {job_id}: {path.name}")
+                seen_filenames.add(path.name)
                 digest, size = _sha256_and_size(path)
                 artifacts.append((path.name, path, digest, size))
             manifest_digest, manifest_size = _sha256_and_size(manifest)
@@ -143,7 +147,7 @@ def build_batch_package(
                 ],
             })
             included.append((job_id, manifest, artifacts))
-        except BatchPackageError as exc:
+        except (BatchPackageError, OSError) as exc:
             entry["reason"] = str(exc)
         entries.append(entry)
 
@@ -174,7 +178,14 @@ def build_batch_package(
                 archive.write(manifest, f"jobs/{job_id}/manifest.json")
                 for filename, path, _digest, _size in artifacts:
                     archive.write(path, f"jobs/{job_id}/outputs/{filename}")
-        os.replace(temp_path, final_path)
+        try:
+            os.replace(temp_path, final_path)
+        except PermissionError:
+            # A previous Flask ``send_file`` response may still hold the
+            # cached archive open on Windows.  Keep that download valid and
+            # publish this regeneration under a fresh path.
+            final_path = package_root / f"{batch_id}-{uuid.uuid4().hex}.zip"
+            os.replace(temp_path, final_path)
     finally:
         try:
             temp_path.unlink()

@@ -123,6 +123,8 @@ curl -X POST http://127.0.0.1:5000/api/batches \
 
 响应会返回 `batch_id` 和每条视频的 `job_id`。使用 `GET /api/batches/<batch_id>` 查看批次状态，或用 `GET /api/batches?limit=20` 找回最近批次；使用原有的 `GET /api/jobs/<job_id>`、`/review` 与 `/outputs` 查看和处理单条任务。批次一次最多接收 8 条视频；本地 worker 忙时，多出的任务保持 `queued`，等待已有任务结束后自动排队。
 
+批次索引采用原子 JSON 写入。Windows 文件短暂占用时会自动重试；本地存储不可用时返回 HTTP 507，并清理已创建的临时子任务。
+
 批次可以下载可审计的 ZIP 交付包：
 
 ```bash

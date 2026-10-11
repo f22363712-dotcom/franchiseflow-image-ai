@@ -402,6 +402,29 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("brand_profile_id", response.get_json()["error"])
 
+    def test_batch_storage_failure_returns_507_and_removes_partial_batch(self):
+        profile_id = f"test_batch_storage_{uuid.uuid4().hex[:8]}"
+        profile_data = {
+            "profile_id": profile_id,
+            "brand_name": "Storage Failure Brand",
+            "branches": [(_make_dummy_image("a"), "a.png")],
+        }
+        try:
+            created = self.client.post("/api/brand-profiles", data=profile_data, content_type="multipart/form-data")
+            self.assertEqual(created.status_code, 201)
+            with patch("app._create_job_from_request", side_effect=OSError("disk full")):
+                response = self.client.post(
+                    "/api/batches",
+                    data={"brand_profile_id": profile_id, "videos": [(_make_dummy_mp4(), "one.mp4")]},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(response.status_code, 507)
+            payload = response.get_json()
+            self.assertIn("disk full", payload["error"])
+            self.assertFalse((BATCH_DIR / f"{payload['batch_id']}.json").exists())
+        finally:
+            shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
     def test_batch_keeps_children_queued_when_worker_pool_is_full(self):
         profile_id = f"test_batch_queue_{uuid.uuid4().hex[:8]}"
         profile_data = {
@@ -479,7 +502,6 @@ class FranchiseFlowAppTests(unittest.TestCase):
                 self.assertFalse(omitted["included"])
                 self.assertEqual(package_manifest["included_job_count"], 1)
                 self.assertEqual(package_manifest["omitted_job_count"], 1)
-            response.close()
             response.close()
         finally:
             shutil.rmtree(completed_dir, ignore_errors=True)

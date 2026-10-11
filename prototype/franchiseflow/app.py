@@ -468,33 +468,38 @@ def _create_job_from_request(
                     if (np.any(scene_points[:, 0] < 0) or np.any(scene_points[:, 0] >= frame_width) or
                             np.any(scene_points[:, 1] < 0) or np.any(scene_points[:, 1] >= frame_height)):
                         raise ValueError(f"manual scene quad {index} lies outside uploaded video frame")
-    except ValueError:
+    except (ValueError, OSError):
         shutil.rmtree(upload_dir, ignore_errors=True)
         shutil.rmtree(output_dir, ignore_errors=True)
         raise
 
-    job = create_job(OUTPUT_DIR, job_id, {
-        "status": "queued",
-        "phase": "queued",
-        "batch_id": batch_id_override,
-        "video_file": video_name,
-        "processing_video_file": processing_video_name,
-        "video_metadata": video_metadata,
-        "branch_files": branch_names,
-        "branch_labels": branch_labels,
-        "branch_count": len(branch_names),
-        "initialization_mode": "manual_fallback" if manual else "vision_model",
-        "manual_quad": manual_quad,
-        "manual_scene_quads": manual_scene_quads,
-        "asset_bindings": asset_bindings,
-        "target_hint": request.form.get("target_hint") or (brand_profile.get("target_hint") if brand_profile else None),
-        "brand_profile_id": brand_profile_id,
-        "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
-        "brand_profile_surface_policy": brand_profile.get("surface_policy") if brand_profile else None,
-        "brand_profile_scene_reuse_policy": brand_profile.get("scene_reuse_policy") if brand_profile else None,
-        "brand_profile_assets": brand_profile.get("branch_assets", []) if brand_profile else [],
-        "output_urls": [],
-    })
+    try:
+        job = create_job(OUTPUT_DIR, job_id, {
+            "status": "queued",
+            "phase": "queued",
+            "batch_id": batch_id_override,
+            "video_file": video_name,
+            "processing_video_file": processing_video_name,
+            "video_metadata": video_metadata,
+            "branch_files": branch_names,
+            "branch_labels": branch_labels,
+            "branch_count": len(branch_names),
+            "initialization_mode": "manual_fallback" if manual else "vision_model",
+            "manual_quad": manual_quad,
+            "manual_scene_quads": manual_scene_quads,
+            "asset_bindings": asset_bindings,
+            "target_hint": request.form.get("target_hint") or (brand_profile.get("target_hint") if brand_profile else None),
+            "brand_profile_id": brand_profile_id,
+            "brand_profile_default_fit": brand_profile.get("default_fit") if brand_profile else None,
+            "brand_profile_surface_policy": brand_profile.get("surface_policy") if brand_profile else None,
+            "brand_profile_scene_reuse_policy": brand_profile.get("scene_reuse_policy") if brand_profile else None,
+            "brand_profile_assets": brand_profile.get("branch_assets", []) if brand_profile else [],
+            "output_urls": [],
+        })
+    except OSError:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
     JOBS[job_id] = job
     return job
 
@@ -1436,12 +1441,15 @@ def create_batch_endpoint():
             return jsonify({"error": f"Video {video.filename} must use a supported video extension: {allowed}"}), 400
 
     batch_id = uuid.uuid4().hex[:12]
-    batch = create_batch(BATCH_DIR, batch_id, {
-        "status": "queued",
-        "brand_profile_id": profile_id,
-        "requested_count": len(videos),
-        "job_ids": [],
-    })
+    try:
+        batch = create_batch(BATCH_DIR, batch_id, {
+            "status": "queued",
+            "brand_profile_id": profile_id,
+            "requested_count": len(videos),
+            "job_ids": [],
+        })
+    except OSError as exc:
+        return jsonify({"error": f"batch storage unavailable: {exc}"}), 507
     created_jobs: list[dict[str, Any]] = []
     try:
         for video in videos:
@@ -1451,7 +1459,7 @@ def create_batch_endpoint():
             # batch index still points to the children already created.
             batch["job_ids"].append(created_jobs[-1]["job_id"])
             save_batch(BATCH_DIR, batch_id, batch)
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         for job in created_jobs:
             job_id = job.get("job_id")
             if job_id:
@@ -1459,10 +1467,13 @@ def create_batch_endpoint():
                 shutil.rmtree(UPLOAD_DIR / job_id, ignore_errors=True)
                 shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
         (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
-        return jsonify({"error": str(exc), "batch_id": batch_id}), 400
+        status_code = 507 if isinstance(exc, OSError) else 400
+        return jsonify({"error": str(exc), "batch_id": batch_id}), status_code
 
+    # Every child ID was persisted immediately after creation above. Avoid a
+    # redundant final replace, which would only add another Windows sharing
+    # violation window after the durable batch index is already complete.
     batch["job_ids"] = [job["job_id"] for job in created_jobs]
-    save_batch(BATCH_DIR, batch_id, batch)
     queued_count = 0
     for job in created_jobs:
         try:
