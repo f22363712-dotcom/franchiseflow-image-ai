@@ -14,7 +14,13 @@
 
 2026-10-12 在当前电脑分别请求国际地址和国内地址，均返回 HTTP 403。客户端已把这个状态转换为明确错误，并且不会生成猜测的四角或伪造成功结果。
 
-这说明当前还不能把网关访问当作已验证能力。可能原因包括网关需要特定来源、访问白名单、不同请求路径或额外协议约定。提交前需要用提供方给出的准确接口文档或在允许访问的网络环境再跑一次 `auto_quad.py`。
+最新实测验证（2026-10-12）：
+- 执行 `python spikes/franchiseflow/auto_quad.py --image spikes/franchiseflow/fixtures/real_storefront_first.jpg --out-json spikes/franchiseflow/quad_auto.json --preview spikes/franchiseflow/quad_auto_preview.jpg`
+- 接口真实返回：`Vision API error: vision gateway returned HTTP 403; check base URL, key, and gateway access`
+- 客户端未产生 `quad_auto.json`，未产生预览图，未在日志或输出中泄漏任何 API Key 或鉴权头部。
+- 根据计划止损条件：由于接口返回 HTTP 403，记录真实错误并停止对实时 API 的依赖；不可使用手工标注四角冒充模型在线识别；演示与离线验证明确标注四角为手动初始化兜底（manual engineering fallback）。
+
+这说明当前还不能把网关访问当作已验证能力。可能原因包括网关需要特定来源、访问白名单、不同请求路径或额外协议约定。若后续比赛方提供更正后的网关地址或网络环境，可通过同一接口重新验证。
 
 ## 代码安全
 

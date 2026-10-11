@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -43,6 +45,19 @@ def _json_from_text(text: str) -> dict[str, Any]:
     return value
 
 
+def _is_convex_quad(pts: list[list[float]]) -> bool:
+    signs: list[bool] = []
+    for i in range(4):
+        dx1 = pts[(i + 1) % 4][0] - pts[i][0]
+        dy1 = pts[(i + 1) % 4][1] - pts[i][1]
+        dx2 = pts[(i + 2) % 4][0] - pts[(i + 1) % 4][0]
+        dy2 = pts[(i + 2) % 4][1] - pts[(i + 1) % 4][1]
+        cp = dx1 * dy2 - dy1 * dx2
+        if cp != 0:
+            signs.append(cp > 0)
+    return len(signs) == 4 and (all(signs) or not any(signs))
+
+
 def normalize_quad(value: Any, width: int, height: int) -> list[list[float]]:
     """Accept pixel or 0..1 coordinates and return validated pixel corners."""
     if not isinstance(value, list) or len(value) != 4:
@@ -51,14 +66,29 @@ def normalize_quad(value: Any, width: int, height: int) -> list[list[float]]:
     for point in value:
         if not isinstance(point, (list, tuple)) or len(point) != 2:
             raise ValueError("each quad corner must be [x, y]")
-        x, y = float(point[0]), float(point[1])
-        if not (x == x and y == y):
-            raise ValueError("quad contains NaN")
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("each quad corner coordinate must be a number") from exc
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError("quad contains NaN or non-finite values")
         points.append([x, y])
-    if all(0 <= x <= 1 and 0 <= y <= 1 for x, y in points):
+
+    all_unit = all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for x, y in points)
+    if all_unit:
         points = [[x * width, y * height] for x, y in points]
+    else:
+        has_fractional_unit = any((0.0 < x < 1.0 or 0.0 < y < 1.0) for x, y in points)
+        has_large_pixel = any((x > 1.0 or y > 1.0) for x, y in points)
+        if has_fractional_unit and has_large_pixel:
+            raise ValueError("quad contains mixed normalized and pixel coordinates")
+
     if any(x < -0.05 * width or x > 1.05 * width or y < -0.05 * height or y > 1.05 * height for x, y in points):
         raise ValueError("quad lies outside the image")
+
+    if not _is_convex_quad(points):
+        raise ValueError("quad must be a convex polygon")
+
     area = abs(sum(points[i][0] * points[(i + 1) % 4][1] - points[(i + 1) % 4][0] * points[i][1] for i in range(4))) / 2
     if area < 100:
         raise ValueError("quad area is too small")
@@ -105,7 +135,11 @@ class VisionClient:
         except urllib.error.HTTPError as exc:
             # Never echo gateway response bodies because proxies sometimes reflect headers.
             raise RuntimeError(f"vision gateway returned HTTP {exc.code}; check base URL, key, and gateway access") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(f"vision gateway timed out after {self.timeout}s") from exc
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)) or "timed out" in str(exc.reason).lower():
+                raise RuntimeError(f"vision gateway timed out after {self.timeout}s") from exc
             raise RuntimeError(f"vision gateway is unreachable: {exc.reason}") from exc
         try:
             envelope = json.loads(raw)
