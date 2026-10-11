@@ -1279,10 +1279,92 @@ def _process_job(job_id: str) -> None:
 
 
 def _recover_jobs() -> None:
-    """Resume queued/running jobs after a local process restart."""
+    """Repair batch indexes, then resume queued/running jobs after a restart."""
     global _RECOVERY_STARTED
     _RECOVERY_STARTED = True
+    _reconcile_orphaned_batch_jobs()
     _schedule_queued_jobs()
+
+
+def _reconcile_orphaned_batch_jobs() -> dict[str, Any]:
+    """Attach durable batch children whose index update was interrupted.
+
+    Batch creation writes a child ``job.json`` before appending its ID to the
+    batch index.  A process stop in that small window must not turn the child
+    into an invisible ordinary job.  Only jobs that explicitly carry a
+    ``batch_id`` pointing at an existing batch are considered; standalone jobs
+    and jobs from a deleted/failed batch are left untouched.
+    """
+    batches: dict[str, dict[str, Any]] = {}
+    try:
+        batch_paths = sorted(BATCH_DIR.glob("*.json"), key=lambda path: path.name)
+    except OSError:
+        return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
+    for batch_path in batch_paths:
+        batch_id = batch_path.stem
+        if not JOB_ID_RE.fullmatch(batch_id):
+            continue
+        try:
+            batch = load_batch(BATCH_DIR, batch_id)
+        except (ValueError, RuntimeError, OSError):
+            continue
+        if isinstance(batch, dict):
+            batches[batch_id] = batch
+    if not batches:
+        return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 0}
+
+    candidates: dict[str, list[dict[str, Any]]] = {batch_id: [] for batch_id in batches}
+    try:
+        state_paths = sorted(OUTPUT_DIR.glob("*/job.json"), key=lambda path: path.parent.name)
+    except OSError:
+        return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
+    for state_path in state_paths:
+        job_id = state_path.parent.name
+        if not JOB_ID_RE.fullmatch(job_id):
+            continue
+        try:
+            job = load_job(OUTPUT_DIR, job_id)
+        except (ValueError, RuntimeError, OSError):
+            continue
+        if not isinstance(job, dict):
+            continue
+        batch_id = job.get("batch_id")
+        if not isinstance(batch_id, str) or batch_id not in batches:
+            continue
+        job_identity = job.get("job_id")
+        if job_identity != job_id:
+            continue
+        current_ids = batches[batch_id].get("job_ids", [])
+        if isinstance(current_ids, list) and job_id in {str(item) for item in current_ids}:
+            continue
+        candidates[batch_id].append(job)
+
+    repaired_batches = 0
+    repaired_jobs = 0
+    errors = 0
+    for batch_id, jobs in candidates.items():
+        if not jobs:
+            continue
+        batch = batches[batch_id]
+        current_ids = batch.get("job_ids")
+        if not isinstance(current_ids, list):
+            current_ids = []
+        existing = [str(item) for item in current_ids]
+        # Creation is serial, so creation time is the closest durable signal
+        # for the original upload order when more than one child was orphaned.
+        jobs.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("job_id"))))
+        additions = [str(job["job_id"]) for job in jobs if str(job["job_id"]) not in existing]
+        if not additions:
+            continue
+        batch["job_ids"] = existing + additions
+        try:
+            save_batch(BATCH_DIR, batch_id, batch)
+        except (OSError, RuntimeError, ValueError):
+            errors += 1
+            continue
+        repaired_batches += 1
+        repaired_jobs += len(additions)
+    return {"repaired_batches": repaired_batches, "repaired_jobs": repaired_jobs, "errors": errors}
 
 
 def _schedule_queued_jobs() -> None:

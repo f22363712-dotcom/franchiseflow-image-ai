@@ -20,7 +20,18 @@ sys.path.insert(0, str(PROTOTYPE_DIR))
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
-from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, PROFILE_DIR, BATCH_DIR, _locate_scenes, _normalise_candidate, _public_summary
+from app import (
+    app,
+    JOBS,
+    UPLOAD_DIR,
+    OUTPUT_DIR,
+    PROFILE_DIR,
+    BATCH_DIR,
+    _locate_scenes,
+    _normalise_candidate,
+    _public_summary,
+    _reconcile_orphaned_batch_jobs,
+)
 from job_store import create_job, load_job, save_job
 from batch_store import create_batch
 from scene_samples import sample_video_scenes
@@ -525,6 +536,77 @@ class FranchiseFlowAppTests(unittest.TestCase):
             self.assertEqual(payload["counts"]["queued"], 2)
         finally:
             shutil.rmtree(PROFILE_DIR / profile_id, ignore_errors=True)
+
+    def test_restart_reconciles_orphaned_batch_child_without_touching_standalone_job(self):
+        import app as app_module
+
+        batch_id = f"recover_batch_{uuid.uuid4().hex[:8]}"
+        orphan_id = f"recover_child_{uuid.uuid4().hex[:8]}"
+        standalone_id = f"recover_single_{uuid.uuid4().hex[:8]}"
+        try:
+            create_batch(BATCH_DIR, batch_id, {
+                "status": "queued",
+                "requested_count": 1,
+                "job_ids": [],
+            })
+            # This models a stop after create_job() fsynced job.json and before
+            # the parent batch index could append the child ID.
+            create_job(OUTPUT_DIR, orphan_id, {
+                "status": "queued",
+                "phase": "queued",
+                "batch_id": batch_id,
+                "video_file": "orphan.mp4",
+                "branch_files": ["branch_1.png"],
+                "branch_labels": ["orphan"],
+                "branch_count": 1,
+            })
+            create_job(OUTPUT_DIR, standalone_id, {
+                "status": "queued",
+                "phase": "queued",
+                "video_file": "standalone.mp4",
+                "branch_files": ["branch_1.png"],
+                "branch_labels": ["standalone"],
+                "branch_count": 1,
+            })
+            with patch.object(app_module, "_submit_job") as submit:
+                app_module._recover_jobs()
+            repaired = app_module.load_batch(BATCH_DIR, batch_id)
+            self.assertEqual(repaired["job_ids"], [orphan_id])
+            submit.assert_any_call(orphan_id)
+
+            visible = self.client.get(f"/api/batches/{batch_id}")
+            self.assertEqual(visible.status_code, 200)
+            self.assertEqual(visible.get_json()["job_ids"], [orphan_id])
+            self.assertEqual(visible.get_json()["jobs"][0]["status"], "queued")
+            self.assertEqual(_reconcile_orphaned_batch_jobs()["repaired_jobs"], 0)
+        finally:
+            app_module._RECOVERY_STARTED = False
+            shutil.rmtree(OUTPUT_DIR / orphan_id, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / standalone_id, ignore_errors=True)
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
+
+    def test_orphan_recovery_leaves_child_unindexed_when_batch_write_fails(self):
+        import app as app_module
+
+        batch_id = f"recover_write_{uuid.uuid4().hex[:8]}"
+        orphan_id = f"recover_write_child_{uuid.uuid4().hex[:8]}"
+        try:
+            create_batch(BATCH_DIR, batch_id, {"status": "queued", "job_ids": []})
+            create_job(OUTPUT_DIR, orphan_id, {
+                "status": "queued",
+                "batch_id": batch_id,
+                "video_file": "orphan.mp4",
+                "branch_files": ["branch_1.png"],
+                "branch_count": 1,
+            })
+            with patch.object(app_module, "save_batch", side_effect=OSError("disk full")):
+                result = _reconcile_orphaned_batch_jobs()
+            self.assertEqual(result["repaired_jobs"], 0)
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(app_module.load_batch(BATCH_DIR, batch_id)["job_ids"], [])
+        finally:
+            shutil.rmtree(OUTPUT_DIR / orphan_id, ignore_errors=True)
+            (BATCH_DIR / f"{batch_id}.json").unlink(missing_ok=True)
 
     def test_batch_download_packages_completed_children_and_audit_manifests(self):
         batch_id = f"download_{uuid.uuid4().hex[:8]}"
