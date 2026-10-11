@@ -1605,6 +1605,99 @@ def get_job(job_id: str):
     return jsonify(job)
 
 
+@app.route("/api/jobs/<job_id>/retry", methods=["POST"])
+def retry_job(job_id: str):
+    """Requeue a failed job while retaining its original uploaded inputs.
+
+    A retry keeps the durable job ID so batch indexes and browser links remain
+    valid.  Existing output files are moved aside until the worker is accepted
+    by the queue; a full queue therefore cannot destroy the previous failure
+    record or its artifacts.
+    """
+    job = _job(job_id)
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+    if job.get("status") not in {"failed", "vision_failed"}:
+        return jsonify({"error": "Only failed or vision_failed jobs can be retried", "status": job.get("status")}), 409
+    try:
+        video_path, sign_paths, output_dir = _paths(job)
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"Job inputs are invalid: {exc}"}), 409
+    missing = [str(path.name) for path in [video_path, *sign_paths] if not path.is_file()]
+    if missing:
+        return jsonify({"error": "Retry inputs are missing", "missing": missing}), 409
+    if _active_slot_count() >= MAX_ACTIVE_JOBS:
+        return jsonify({"error": f"active job queue is full ({MAX_ACTIVE_JOBS} jobs); try again later"}), 429
+
+    # Keep the old output directory until _submit_job succeeds.  _set_job()
+    # writes the fresh manifest into a newly-created directory.
+    backup_root = OUTPUT_DIR / ".retry-backups"
+    backup_dir = backup_root / f"{job_id}-{uuid.uuid4().hex[:8]}"
+    had_output_dir = output_dir.exists()
+    if had_output_dir:
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            os.replace(output_dir, backup_dir)
+        except OSError as exc:
+            return jsonify({"error": f"could not prepare retry outputs: {exc}"}), 507
+    previous = dict(job)
+    retry_job_state = dict(job)
+    retry_job_state.update({
+        "status": "queued",
+        "phase": "queued",
+        "error": None,
+        "input_error": False,
+        "summary": {},
+        "outputs": [],
+        "output_urls": [],
+        "quality_gate": None,
+        "quality_review": None,
+        "candidate": None,
+        "candidates": [],
+        "validation": None,
+        "validations": [],
+        "vision_audit": None,
+        "scenes": [],
+        "scene_plan": [],
+        "sample_preview": None,
+        "contact_sheet_preview": None,
+        "model": None,
+        "asset_bindings": None,
+    })
+    try:
+        _set_job(retry_job_state)
+        _submit_job(job_id)
+    except RuntimeError as exc:
+        # Restore both the status and files when a concurrent request filled
+        # the queue after the preflight check.
+        shutil.rmtree(output_dir, ignore_errors=True)
+        if backup_dir.exists():
+            os.replace(backup_dir, output_dir)
+        try:
+            backup_root.rmdir()
+        except OSError:
+            pass
+        _set_job(previous)
+        return jsonify({"error": str(exc)}), 429
+    except OSError as exc:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        if backup_dir.exists():
+            os.replace(backup_dir, output_dir)
+        try:
+            backup_root.rmdir()
+        except OSError:
+            pass
+        _set_job(previous)
+        return jsonify({"error": f"could not persist retry: {exc}"}), 507
+    else:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        try:
+            backup_root.rmdir()
+        except OSError:
+            pass
+    return jsonify(_job(job_id) or retry_job_state), 202
+
+
 @app.route("/api/jobs/<job_id>/review", methods=["POST"])
 def review_job(job_id: str):
     job = _job(job_id)

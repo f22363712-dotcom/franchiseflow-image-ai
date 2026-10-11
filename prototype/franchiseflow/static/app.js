@@ -313,6 +313,32 @@ document.addEventListener('DOMContentLoaded', () => {
       .catch(showError);
   }
 
+  async function retryBatchJob(jobId, button) {
+    if (!jobId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = '正在重试…';
+    }
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
+      const job = await response.json();
+      if (!response.ok) throw new Error(job.error || `重试失败（HTTP ${response.status}）`);
+      if (activeBatchId) {
+        batchPollToken += 1;
+        await pollBatch(activeBatchId, batchPollToken);
+      } else {
+        await pollJob(jobId);
+      }
+    } catch (error) {
+      showBatchError(error);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = '重试此视频';
+      }
+    }
+  }
+
   function renderBatch(batch) {
     if (!batchResults || !batchJobs) return;
     batchResults.hidden = false;
@@ -367,6 +393,14 @@ document.addEventListener('DOMContentLoaded', () => {
         review.textContent = '打开人工复核';
         review.addEventListener('click', () => openBatchJob(job.job_id));
         actions.appendChild(review);
+      }
+      if (job.status === 'failed' || job.status === 'vision_failed') {
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'btn btn-secondary batch-retry-button';
+        retry.textContent = '重试此视频';
+        retry.addEventListener('click', () => retryBatchJob(job.job_id, retry));
+        actions.appendChild(retry);
       }
       batchOutputLinks(job).forEach(link => actions.appendChild(link));
       if (actions.children.length) card.appendChild(actions);

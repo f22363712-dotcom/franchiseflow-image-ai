@@ -44,6 +44,14 @@ class JobStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             save_job(self.root, "abc123", job)
 
+    def test_failed_attempt_can_be_requeued_for_explicit_retry(self):
+        for previous_status in ("failed", "vision_failed"):
+            job_id = f"retry_{previous_status}"
+            job = create_job(self.root, job_id, {"status": previous_status})
+            job["status"] = "queued"
+            save_job(self.root, job_id, job)
+            self.assertEqual(load_job(self.root, job_id)["status"], "queued")
+
     def test_save_retries_transient_windows_replace_error(self):
         job = create_job(self.root, "retry123", {"status": "queued"})
         job["status"] = "running"

@@ -17,8 +17,11 @@ ALLOWED_TRANSITIONS = {
     "running": {"running", "queued", "needs_review", "completed", "failed", "vision_failed"},
     "needs_review": {"needs_review", "queued", "completed", "failed"},
     "completed": {"completed"},
-    "failed": {"failed"},
-    "vision_failed": {"vision_failed"},
+    # A failed attempt may be explicitly requeued after its original inputs
+    # remain available. Other terminal states stay immutable so a retry
+    # cannot silently replace an accepted delivery.
+    "failed": {"failed", "queued"},
+    "vision_failed": {"vision_failed", "queued"},
 }
 
 

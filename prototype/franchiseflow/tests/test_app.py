@@ -215,6 +215,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
             "pollBatch",
             "/api/batches/${encodeURIComponent(batchId)}",
             "/api/batches/${encodeURIComponent(batch.batch_id)}/download",
+            "/api/jobs/${encodeURIComponent(jobId)}/retry",
+            "重试此视频",
             "打开人工复核",
             "franchiseflow_batch_id",
         ):
@@ -661,6 +663,114 @@ class FranchiseFlowAppTests(unittest.TestCase):
     def test_list_jobs_rejects_invalid_filter(self):
         response = self.client.get("/api/jobs?status=unknown")
         self.assertEqual(response.status_code, 400)
+
+    def test_failed_job_retry_reuses_inputs_and_clears_stale_outputs(self):
+        job_id = f"retry_{uuid.uuid4().hex[:8]}"
+        upload_dir = UPLOAD_DIR / job_id
+        output_dir = OUTPUT_DIR / job_id
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (upload_dir / "video.mp4").write_bytes(b"source")
+            (upload_dir / "branch_1.png").write_bytes(b"branch")
+            (output_dir / "stale.mp4").write_bytes(b"stale")
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "failed", "phase": "failed", "error": "temporary failure",
+                "video_file": "video.mp4", "processing_video_file": "video.mp4",
+                "branch_files": ["branch_1.png"], "branch_count": 1, "outputs": ["/outputs/retry/stale.mp4"],
+            })
+            with patch("app._submit_job") as submit:
+                response = self.client.post(f"/api/jobs/{job_id}/retry")
+            self.assertEqual(response.status_code, 202)
+            submit.assert_called_once_with(job_id)
+            retried = response.get_json()
+            self.assertEqual(retried["status"], "queued")
+            self.assertEqual(retried["outputs"], [])
+            self.assertIsNone(retried["error"])
+            self.assertFalse((output_dir / "stale.mp4").exists())
+            self.assertTrue((upload_dir / "video.mp4").exists())
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+    def test_retry_queue_full_restores_failed_state_and_outputs(self):
+        job_id = f"retry_full_{uuid.uuid4().hex[:8]}"
+        upload_dir = UPLOAD_DIR / job_id
+        output_dir = OUTPUT_DIR / job_id
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (upload_dir / "video.mp4").write_bytes(b"source")
+            (upload_dir / "branch_1.png").write_bytes(b"branch")
+            (output_dir / "stale.mp4").write_bytes(b"stale")
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "vision_failed", "phase": "vision_failed", "error": "gateway",
+                "video_file": "video.mp4", "processing_video_file": "video.mp4", "branch_files": ["branch_1.png"],
+            })
+            with patch("app._submit_job", side_effect=RuntimeError("active job queue is full (4 jobs); try again later")):
+                response = self.client.post(f"/api/jobs/{job_id}/retry")
+            self.assertEqual(response.status_code, 429)
+            persisted = self.client.get(f"/api/jobs/{job_id}").get_json()
+            self.assertEqual(persisted["status"], "vision_failed")
+            self.assertEqual(persisted["error"], "gateway")
+            self.assertTrue((output_dir / "stale.mp4").exists())
+            self.assertFalse((OUTPUT_DIR / ".retry-backups").exists())
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+    def test_retry_storage_failure_restores_failed_state_and_outputs(self):
+        job_id = f"retry_oserror_{uuid.uuid4().hex[:8]}"
+        upload_dir = UPLOAD_DIR / job_id
+        output_dir = OUTPUT_DIR / job_id
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (upload_dir / "video.mp4").write_bytes(b"source")
+            (upload_dir / "branch_1.png").write_bytes(b"branch")
+            (output_dir / "stale.mp4").write_bytes(b"stale")
+            create_job(OUTPUT_DIR, job_id, {
+                "status": "failed", "phase": "failed", "error": "temporary failure",
+                "video_file": "video.mp4", "processing_video_file": "video.mp4", "branch_files": ["branch_1.png"],
+            })
+            with patch("app._submit_job", side_effect=OSError("state locked")):
+                response = self.client.post(f"/api/jobs/{job_id}/retry")
+            self.assertEqual(response.status_code, 507)
+            persisted = self.client.get(f"/api/jobs/{job_id}").get_json()
+            self.assertEqual(persisted["status"], "failed")
+            self.assertEqual(persisted["error"], "temporary failure")
+            self.assertTrue((output_dir / "stale.mp4").exists())
+            self.assertFalse((OUTPUT_DIR / ".retry-backups").exists())
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / ".retry-backups", ignore_errors=True)
+            (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+    def test_retry_rejects_completed_job_and_missing_inputs(self):
+        job_id = f"retry_invalid_{uuid.uuid4().hex[:8]}"
+        missing_id = f"retry_missing_{uuid.uuid4().hex[:8]}"
+        try:
+            create_job(OUTPUT_DIR, job_id, {"status": "completed", "phase": "complete"})
+            response = self.client.post(f"/api/jobs/{job_id}/retry")
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["status"], "completed")
+            create_job(OUTPUT_DIR, missing_id, {
+                "status": "failed", "phase": "failed", "video_file": "missing.mp4",
+                "processing_video_file": "missing.mp4", "branch_files": ["branch.png"],
+            })
+            missing = self.client.post(f"/api/jobs/{missing_id}/retry")
+            self.assertEqual(missing.status_code, 409)
+            self.assertIn("missing", missing.get_json()["error"])
+        finally:
+            shutil.rmtree(UPLOAD_DIR / job_id, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
+            (OUTPUT_DIR / f"{job_id}.json").unlink(missing_ok=True)
+            shutil.rmtree(UPLOAD_DIR / missing_id, ignore_errors=True)
+            shutil.rmtree(OUTPUT_DIR / missing_id, ignore_errors=True)
+            (OUTPUT_DIR / f"{missing_id}.json").unlink(missing_ok=True)
 
     def test_create_job_normalizes_mov_source_and_keeps_original_name(self):
         data = {

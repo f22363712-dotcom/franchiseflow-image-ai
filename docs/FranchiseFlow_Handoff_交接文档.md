@@ -93,6 +93,7 @@ python prototype/franchiseflow/app.py
 - 可通过页面的“保存为品牌配置”面板或 `POST /api/brand-profiles` 保存品牌提示词、分店标签和招牌图片；后续任务只传 `brand_profile_id` 和视频即可复用，任务清单会记录配置 ID、素材 SHA-256 和素材适配策略。配置默认用 `surface_policy=review`，确认所有分店素材都覆盖全部已验证平面时才使用 `surface_policy=all_surfaces`。`scene_reuse_policy=reuse_if_verified` 会尝试跨镜头复用候选，复用必须通过当前镜头的 SIFT/RANSAC 和多帧验证。
 - 自动定位会把任务中的前四张分店素材作为品牌外观参考图发送给视觉模型，提示词要求四角坐标只能来自视频联系图；参考图 SHA-256 会写入视觉审计。它只提供外观线索，不能替代多帧几何验证。
 - 页面新增“批量本地化生产”区域。选择已保存的品牌配置后可以一次提交最多 8 条视频，页面轮询批次状态并展示每条成片链接；单条任务需要人工复核时，可从批次卡片打开原有复核面板。批次也可以通过 `POST /api/batches` 和 `GET /api/batches/<batch_id>` 使用。
+- 批次中的 `failed` 或 `vision_failed` 子任务会显示“重试此视频”。重试沿用原任务 ID、视频和分店素材，清除旧输出后重新进入队列；队列满或存储异常会恢复原失败状态和产物。
 - 批次交付可以调用 `GET /api/batches/<batch_id>/download` 获取 ZIP。根目录 `batch_manifest.json` 列出所有子任务及状态；只有已完成且文件路径校验通过的任务才会包含 `jobs/<job_id>/manifest.json`、MP4 和 SHA-256/字节数清单。未完成、失败、人工复核或缺少成片的任务只保留状态，不会进入视频目录；没有任何可交付子任务时接口返回 409。
 
 ### 4.2 运行全量自动化测试

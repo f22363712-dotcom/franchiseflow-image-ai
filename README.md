@@ -123,6 +123,14 @@ curl -X POST http://127.0.0.1:5000/api/batches \
 
 响应会返回 `batch_id` 和每条视频的 `job_id`。使用 `GET /api/batches/<batch_id>` 查看批次状态，或用 `GET /api/batches?limit=20` 找回最近批次；使用原有的 `GET /api/jobs/<job_id>`、`/review` 与 `/outputs` 查看和处理单条任务。批次一次最多接收 8 条视频；本地 worker 忙时，多出的任务保持 `queued`，等待已有任务结束后自动排队。
 
+失败的子任务可以保留原上传素材直接重试，不需要重新上传视频或分店图片：
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/jobs/<job_id>/retry
+```
+
+接口只接受 `failed` 或 `vision_failed` 状态。重试成功后沿用原 `job_id` 并重新进入 `queued`；队列满、输入文件缺失或本地存储失败会返回错误，同时保留原失败记录和已有产物。批次页面会在这两种失败状态下显示“重试此视频”。
+
 批次索引采用原子 JSON 写入。Windows 文件短暂占用时会自动重试；本地存储不可用时返回 HTTP 507，并清理已创建的临时子任务。
 
 批次可以下载可审计的 ZIP 交付包：
