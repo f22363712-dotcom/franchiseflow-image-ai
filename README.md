@@ -85,7 +85,7 @@ python spikes/franchiseflow/tracker.py \
 
 ## Scene / Surface 实验接口
 
-跟踪器已经提供最多四个独立平面的实验参数 `--surface-quad-json` 和 `--asset-binding-json`。Web 任务使用最多八个硬切场景的清单，每个场景最多四个平面。每个平面拥有自己的 SIFT/RANSAC/LK 跟踪器，单个平面失效时只保留该平面的原画，其他平面继续处理。一个分支可以显式引用多个平面，多个分支也可以分别引用同一个平面。软切、遮挡抠像和跨镜头自动匹配仍需单独验证。
+跟踪器已经提供最多四个独立平面的实验参数 `--surface-quad-json` 和 `--asset-binding-json`。Web 任务使用最多八个硬切场景的清单，每个场景最多四个平面。每个平面拥有自己的 SIFT/RANSAC/LK 跟踪器，单个平面失效时只保留该平面的原画，其他平面继续处理。一个分支可以显式引用多个平面，多个分支也可以分别引用同一个平面。`asset_bindings.fit` 支持 `cover` 和 `contain`，前者铺满平面，后者保留素材宽高比并在平面内留出透明边界。软切、遮挡抠像和跨镜头自动匹配仍需单独验证。
 
 ## Tests
 

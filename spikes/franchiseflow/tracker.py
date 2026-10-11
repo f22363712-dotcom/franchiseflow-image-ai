@@ -277,11 +277,44 @@ def load_sign(path: Path):
     return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
 
 
-def composite(frame, sign, quad, illumination=False):
+def _bilinear_quad_point(quad: np.ndarray, u: float, v: float) -> np.ndarray:
+    top = quad[0] * (1.0 - u) + quad[1] * u
+    bottom = quad[3] * (1.0 - u) + quad[2] * u
+    return top * (1.0 - v) + bottom * v
+
+
+def _fit_quad(quad: np.ndarray, source_aspect: float, fit: str) -> np.ndarray:
+    if fit == "cover":
+        return quad
+    if fit != "contain":
+        raise ValueError(f"unsupported asset fit mode: {fit}")
+    target_width = max(float(np.linalg.norm(quad[1] - quad[0])), 1e-6)
+    target_height = max(float(np.linalg.norm(quad[3] - quad[0])), 1e-6)
+    target_aspect = target_width / target_height
+    if source_aspect > target_aspect:
+        visible_height = target_aspect / source_aspect
+        v0 = (1.0 - visible_height) / 2.0
+        u0, u1 = 0.0, 1.0
+        v1 = 1.0 - v0
+    else:
+        visible_width = source_aspect / target_aspect
+        u0 = (1.0 - visible_width) / 2.0
+        u1 = 1.0 - u0
+        v0, v1 = 0.0, 1.0
+    return np.float32([
+        _bilinear_quad_point(quad, u0, v0),
+        _bilinear_quad_point(quad, u1, v0),
+        _bilinear_quad_point(quad, u1, v1),
+        _bilinear_quad_point(quad, u0, v1),
+    ])
+
+
+def composite(frame, sign, quad, illumination=False, fit="cover"):
     height, width = frame.shape[:2]
     sh, sw = sign.shape[:2]
     src = np.float32([[0, 0], [sw - 1, 0], [sw - 1, sh - 1], [0, sh - 1]])
-    transform = cv2.getPerspectiveTransform(src, quad.astype(np.float32))
+    target_quad = _fit_quad(quad.astype(np.float32), sw / max(sh, 1), fit)
+    transform = cv2.getPerspectiveTransform(src, target_quad)
     warped = cv2.warpPerspective(sign, transform, (width, height), flags=cv2.INTER_LINEAR)
     colour = warped[:, :, :3].astype(np.float32)
     alpha = warped[:, :, 3:4].astype(np.float32) / 255
@@ -307,7 +340,7 @@ def parse_quad(value: Any) -> np.ndarray:
 
 
 _INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate"}
-_FIT_MODES = {"cover"}
+_FIT_MODES = {"cover", "contain"}
 
 
 def normalize_branch_labels(labels: list[str] | None, signs: list[str | Path]) -> list[str]:
@@ -549,6 +582,10 @@ def run_tracker(
         item["branch_index"]: set(item["surface_ids"])
         for item in normalized_bindings
     }
+    fit_by_branch = {
+        item["branch_index"]: item["fit"]
+        for item in normalized_bindings
+    }
     max_surface_count = max((len(scene["surfaces"]) for scene in (normalized_scene_plan or [])), default=surface_count)
     scene_stats = [
         {
@@ -702,7 +739,7 @@ def run_tracker(
                 rendered = frame
                 for surface_id, current_quad in zip(active_surface_ids, current_quads):
                     if current_quad is not None and surface_id in allowed_surface_ids:
-                        rendered = composite(rendered, sign, current_quad, illumination)
+                        rendered = composite(rendered, sign, current_quad, illumination, fit_by_branch[branch_index])
                 writer.write(rendered)
             if debug is not None:
                 annotated = frame.copy()

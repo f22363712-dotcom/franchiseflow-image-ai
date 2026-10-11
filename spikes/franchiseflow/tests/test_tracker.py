@@ -205,6 +205,16 @@ class TrackerSyntheticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly 2 labels"):
             normalize_branch_labels(["only_one"], ["a.png", "b.png"])
 
+    def test_contain_fit_preserves_aspect_inside_target_quad(self):
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+        sign = np.full((20, 80, 4), (0, 0, 255, 255), dtype=np.uint8)
+        quad = np.float32([[20, 20], [100, 20], [100, 100], [20, 100]])
+        contained = composite(frame, sign, quad, fit="contain")
+        covered = composite(frame, sign, quad, fit="cover")
+        self.assertLess(int(contained[22, 60, 2]), 20)
+        self.assertGreater(int(contained[60, 60, 2]), 180)
+        self.assertGreater(int(covered[22, 60, 2]), 180)
+
     def test_run_tracker_supports_two_independent_surfaces(self):
         video_path = self.temp_dir / "two_surfaces.mp4"
         frame = _create_textured_image()
