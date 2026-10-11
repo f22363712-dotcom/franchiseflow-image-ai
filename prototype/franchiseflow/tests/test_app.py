@@ -198,6 +198,8 @@ class FranchiseFlowAppTests(unittest.TestCase):
             data = res.get_json()
             self.assertEqual(data["status"], "completed")
             self.assertEqual(len(data["outputs"]), 3)
+            self.assertEqual(data["initialization_mode"], "manual_fallback")
+            self.assertTrue(data["summary"].get("legacy_demo"))
 
     def test_create_job_accepts_one_branch_and_returns_202(self):
         data = {
@@ -213,6 +215,29 @@ class FranchiseFlowAppTests(unittest.TestCase):
         get_res = self.client.get(f"/api/jobs/{payload['job_id']}")
         self.assertEqual(get_res.status_code, 200)
         self.assertEqual(get_res.get_json()["branch_count"], 1)
+
+    def test_create_job_normalizes_mov_source_and_keeps_original_name(self):
+        data = {
+            "video": (_make_dummy_mp4(), "phone_capture.mov"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+
+        def copy_as_working(source, destination):
+            shutil.copyfile(source, destination)
+            return destination
+
+        with patch("app.normalize_video_for_processing", side_effect=copy_as_working), patch("app._submit_job") as submit:
+            response = self.client.post("/api/jobs", data=data, content_type="multipart/form-data")
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertEqual(payload["video_file"], "phone_capture.mov")
+        self.assertEqual(payload["processing_video_file"], "processing_input.mp4")
+        self.assertEqual(payload["video_metadata"]["source_extension"], ".mov")
+        self.assertEqual(payload["video_metadata"]["processing_extension"], ".mp4")
+        self.assertTrue((UPLOAD_DIR / payload["job_id"] / "phone_capture.mov").exists())
+        self.assertTrue((UPLOAD_DIR / payload["job_id"] / "processing_input.mp4").exists())
+        submit.assert_called_once_with(payload["job_id"])
 
     def test_hard_cut_video_sends_stable_scene_plan_to_tracker(self):
         data = {
@@ -235,6 +260,145 @@ class FranchiseFlowAppTests(unittest.TestCase):
         call = tracker.call_args.kwargs
         self.assertEqual([item["scene_id"] for item in call["scene_plan"]], ["scene_001", "scene_002"])
         self.assertEqual([item["start_frame"] for item in call["scene_plan"]], [0, 2])
+
+    def test_target_hint_is_persisted_and_forwarded_to_vision_client(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+            "target_hint": "Acme Coffee neon fascia",
+        }
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": [{"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9}],
+        }
+        summary = {"frames": 2, "fps": 10.0, "failed_frames": [], "output_videos": []}
+        with patch("app.VisionClient", return_value=mock_instance), \
+             patch("app.validate_candidate", return_value={"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}), \
+             patch("app.run_tracker", return_value=summary):
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        job_id = response.get_json()["job_id"]
+        persisted = self.client.get(f"/api/jobs/{job_id}").get_json()
+        self.assertEqual(persisted["target_hint"], "Acme Coffee neon fascia")
+        mock_instance.locate_candidates.assert_called_once()
+        self.assertEqual(mock_instance.locate_candidates.call_args.kwargs["target_hint"], "Acme Coffee neon fascia")
+
+    def test_each_scene_can_pass_multiple_stable_surfaces_to_tracker(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png"), (_make_dummy_image("b2"), "b2.png")],
+        }
+        candidates = [
+            {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9, "reason": "front"},
+            {"quad": [[140, 20], [220, 20], [220, 80], [140, 80]], "confidence": 0.8, "reason": "side"},
+        ]
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": candidates,
+        }
+        summary = {"frames": 4, "fps": 10.0, "failed_frames": [], "output_videos": ["a.mp4", "b.mp4"]}
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        with patch("app.VisionClient", return_value=mock_instance), \
+             patch("app.validate_candidate", return_value=accepted), \
+             patch("app.run_tracker", return_value=summary) as tracker:
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        call = tracker.call_args.kwargs
+        self.assertEqual([len(scene["surfaces"]) for scene in call["scene_plan"]], [2, 2])
+        self.assertEqual(
+            [surface["surface_id"] for surface in call["scene_plan"][0]["surfaces"]],
+            ["scene_001_surface_001", "scene_001_surface_002"],
+        )
+        self.assertEqual(
+            [surface["surface_id"] for surface in call["scene_plan"][1]["surfaces"]],
+            ["scene_002_surface_001", "scene_002_surface_002"],
+        )
+        self.assertEqual(response.get_json()["summary"]["surface_count"], 4)
+
+    def test_overlapping_candidates_require_review_for_every_scene(self):
+        data = {
+            "video": (_make_two_scene_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        overlapping = [
+            {"quad": [[20, 20], [100, 20], [100, 80], [20, 80]], "confidence": 0.9},
+            {"quad": [[25, 25], [105, 25], [105, 85], [25, 85]], "confidence": 0.8},
+        ]
+        mock_instance = MagicMock()
+        mock_instance.locate_candidates.return_value = {
+            "model": "gemini-3.1-flash-image",
+            "candidates": overlapping,
+        }
+        accepted = {"accepted": True, "requires_human_review": False, "reasons": [], "sample_metrics": []}
+        with patch("app.VisionClient", return_value=mock_instance), patch("app.validate_candidate", return_value=accepted):
+            response = self.client.post("/api/render", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 500)
+        job = next(iter(JOBS.values()))
+        self.assertEqual(job["status"], "needs_review")
+        self.assertEqual(len(job["scenes"]), 2)
+        self.assertTrue(all(scene["status"] == "needs_review" for scene in job["scenes"]))
+        self.assertTrue(all(len(scene["candidates"]) == 2 for scene in job["scenes"]))
+
+    def test_review_accepts_multiple_surfaces_and_keeps_ids(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({
+            "status": "needs_review",
+            "scenes": [{"scene_id": "scene_001", "start_frame": 0, "end_frame": 1, "status": "needs_review"}],
+        })
+        save_job(OUTPUT_DIR, job_id, job)
+        payload = {"scenes": [{
+            "scene_id": "scene_001",
+            "surfaces": [
+                {"surface_id": "front_panel", "quad": [[20, 20], [100, 20], [100, 80], [20, 80]]},
+                {"surface_id": "side_panel", "quad": [[140, 20], [220, 20], [220, 80], [140, 80]]},
+            ],
+        }], "asset_bindings": [
+            {"branch_index": 1, "surface_ids": ["front_panel"], "fit": "cover"},
+        ]}
+        with patch("app._submit_job") as submit:
+            response = self.client.post(f"/api/jobs/{job_id}/review", json=payload)
+        self.assertEqual(response.status_code, 202)
+        saved = load_job(OUTPUT_DIR, job_id)
+        self.assertEqual(
+            [surface["surface_id"] for surface in saved["scene_plan"][0]["surfaces"]],
+            ["front_panel", "side_panel"],
+        )
+        self.assertEqual(saved["asset_bindings"][0]["surface_ids"], ["front_panel"])
+        submit.assert_called_once_with(job_id)
+
+    def test_review_rejects_overlapping_surfaces(self):
+        data = {
+            "video": (_make_dummy_mp4(), "video.mp4"),
+            "branches": [(_make_dummy_image("b1"), "b1.png")],
+        }
+        with patch("app._submit_job"):
+            created = self.client.post("/api/jobs", data=data, content_type="multipart/form-data").get_json()
+        job_id = created["job_id"]
+        job = load_job(OUTPUT_DIR, job_id)
+        job.update({
+            "status": "needs_review",
+            "scenes": [{"scene_id": "scene_001", "start_frame": 0, "end_frame": 1, "status": "needs_review"}],
+        })
+        save_job(OUTPUT_DIR, job_id, job)
+        payload = {"scenes": [{
+            "scene_id": "scene_001",
+            "surfaces": [
+                {"surface_id": "a", "quad": [[20, 20], [100, 20], [100, 80], [20, 80]]},
+                {"surface_id": "b", "quad": [[25, 25], [105, 25], [105, 85], [25, 85]]},
+            ],
+        }]}
+        response = self.client.post(f"/api/jobs/{job_id}/review", json=payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("overlap", response.get_json()["error"].lower())
 
     def test_scene_review_state_is_persisted_before_worker_returns(self):
         data = {

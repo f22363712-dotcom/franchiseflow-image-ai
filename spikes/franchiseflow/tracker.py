@@ -212,6 +212,7 @@ def parse_quad(value: Any) -> np.ndarray:
 
 
 _INITIALIZATION_MODES = {"vision_model", "manual_fallback", "reviewed_candidate"}
+_FIT_MODES = {"cover"}
 
 
 def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
@@ -272,6 +273,62 @@ def _normalize_scene_plan(scene_plan: list[dict] | None) -> list[dict] | None:
     return normalized
 
 
+def _normalize_asset_bindings(
+    asset_bindings: list[dict] | None,
+    branch_count: int,
+    surface_ids: list[str],
+    *,
+    require_explicit: bool,
+) -> list[dict]:
+    """Validate the explicit branch-to-surface render contract.
+
+    A single planar surface keeps the historical behaviour: every branch is
+    rendered onto that one surface.  Once a job has multiple surfaces, the
+    caller must state which branch owns which surface.  This prevents the old
+    nested loop from silently painting every branch on every plane.
+    """
+    if not surface_ids:
+        raise ValueError("at least one surface is required for asset bindings")
+    if asset_bindings is None:
+        if require_explicit:
+            raise ValueError("asset_bindings are required when more than one surface is tracked")
+        return [
+            {"branch_index": branch_index, "surface_ids": list(surface_ids), "fit": "cover"}
+            for branch_index in range(1, branch_count + 1)
+        ]
+    if not isinstance(asset_bindings, list) or len(asset_bindings) != branch_count:
+        raise ValueError(f"asset_bindings must contain exactly {branch_count} branch entries")
+    valid_surface_ids = set(surface_ids)
+    seen_branches: set[int] = set()
+    normalized: list[dict] = []
+    for raw in asset_bindings:
+        if not isinstance(raw, dict):
+            raise ValueError("asset_bindings entries must be objects")
+        branch_index = raw.get("branch_index")
+        if isinstance(branch_index, bool) or not isinstance(branch_index, int) or not 1 <= branch_index <= branch_count:
+            raise ValueError("asset binding branch_index is outside the branch range")
+        if branch_index in seen_branches:
+            raise ValueError(f"duplicate asset binding branch_index: {branch_index}")
+        seen_branches.add(branch_index)
+        raw_surface_ids = raw.get("surface_ids")
+        if not isinstance(raw_surface_ids, list) or not raw_surface_ids:
+            raise ValueError(f"asset binding {branch_index} must name at least one surface_id")
+        if any(not isinstance(surface_id, str) or not surface_id for surface_id in raw_surface_ids):
+            raise ValueError(f"asset binding {branch_index} contains an invalid surface_id")
+        if len(set(raw_surface_ids)) != len(raw_surface_ids):
+            raise ValueError(f"asset binding {branch_index} repeats a surface_id")
+        unknown = sorted(set(raw_surface_ids) - valid_surface_ids)
+        if unknown:
+            raise ValueError(f"asset binding {branch_index} names unknown surface_id(s): {', '.join(unknown)}")
+        fit = raw.get("fit", "cover")
+        if fit not in _FIT_MODES:
+            raise ValueError(f"unsupported asset fit mode: {fit}")
+        normalized.append({"branch_index": branch_index, "surface_ids": list(raw_surface_ids), "fit": fit})
+    if seen_branches != set(range(1, branch_count + 1)):
+        raise ValueError("asset_bindings must provide one entry for every branch")
+    return sorted(normalized, key=lambda item: item["branch_index"])
+
+
 def run_tracker(
     video: str | Path,
     quad: list | np.ndarray | str | Path,
@@ -289,6 +346,7 @@ def run_tracker(
     source_candidate: dict | None = None,
     surface_quads: list[list] | None = None,
     scene_plan: list[dict] | None = None,
+    asset_bindings: list[dict] | None = None,
 ) -> dict[str, Any]:
     video_path = Path(video)
     if not video_path.exists():
@@ -344,12 +402,30 @@ def run_tracker(
     if normalized_scene_plan is None:
         trackers = [PlanarTracker(first, surface, min_inliers, ransac_px, ratio) for surface in surface_points]
         surface_count = len(trackers)
+        surface_ids_for_binding = [f"surface_{position:03d}" for position in range(1, surface_count + 1)]
+        require_explicit_bindings = surface_count > 1
     else:
         # Scene-local trackers are initialized at each scene's own source
         # frame.  No scene plan is allowed to borrow the first scene anchor.
         trackers = []
         surface_points = []
         surface_count = 0
+        surface_ids_for_binding = [
+            surface["surface_id"]
+            for scene in normalized_scene_plan
+            for surface in scene["surfaces"]
+        ]
+        require_explicit_bindings = any(len(scene["surfaces"]) > 1 for scene in normalized_scene_plan)
+    normalized_bindings = _normalize_asset_bindings(
+        asset_bindings,
+        len(signs),
+        surface_ids_for_binding,
+        require_explicit=require_explicit_bindings,
+    )
+    bindings_by_branch = {
+        item["branch_index"]: set(item["surface_ids"])
+        for item in normalized_bindings
+    }
     max_surface_count = max((len(scene["surfaces"]) for scene in (normalized_scene_plan or [])), default=surface_count)
     scene_stats = [
         {
@@ -386,6 +462,7 @@ def run_tracker(
     scene_index = 0
     active_scene = None
     active_scene_stats = None
+    active_surface_ids = list(surface_ids_for_binding) if normalized_scene_plan is None else []
     log_file = (out_dir / "tracking.jsonl").open("w", encoding="utf-8")
     try:
         while frame is not None:
@@ -404,6 +481,7 @@ def run_tracker(
                     active_scene = scene_config
                     active_scene_stats = scene_stats[scene_index]
                     surface_points = [surface["quad"] for surface in active_scene["surfaces"]]
+                    active_surface_ids = [surface["surface_id"] for surface in active_scene["surfaces"]]
                     surface_count = len(surface_points)
                     trackers = []
                     for surface in active_scene["surfaces"]:
@@ -489,13 +567,18 @@ def run_tracker(
                     "reprojection_median_px": float(np.median([item["reprojection_median_px"] for item in valid_details if "reprojection_median_px" in item])) if any("reprojection_median_px" in item for item in valid_details) else 0.0,
                 }
             detail.update(frame=index, seconds=index / fps)
+            detail["branch_surface_ids"] = {
+                str(branch_index): sorted(bindings_by_branch[branch_index] & set(active_surface_ids))
+                for branch_index in range(1, len(signs) + 1)
+            }
             records.append(detail)
             log_file.write(json.dumps(detail) + "\n")
             current_quads = [project_quad(h, surface) if h is not None else None for h, surface in zip(homographies, surface_points)]
-            for writer, sign in zip(writers, loaded_signs):
+            for branch_index, (writer, sign) in enumerate(zip(writers, loaded_signs), start=1):
+                allowed_surface_ids = bindings_by_branch[branch_index]
                 rendered = frame
-                for current_quad in current_quads:
-                    if current_quad is not None:
+                for surface_id, current_quad in zip(active_surface_ids, current_quads):
+                    if current_quad is not None and surface_id in allowed_surface_ids:
                         rendered = composite(rendered, sign, current_quad, illumination)
                 writer.write(rendered)
             if debug is not None:
@@ -582,8 +665,12 @@ def run_tracker(
     branch_scene_surface_map = [
         {
             "branch_index": branch_index,
+            "fit": next(item["fit"] for item in normalized_bindings if item["branch_index"] == branch_index),
             "scenes": [
-                {"scene_id": scene["scene_id"], "surface_ids": scene["surface_ids"]}
+                {
+                    "scene_id": scene["scene_id"],
+                    "surface_ids": [surface_id for surface_id in scene["surface_ids"] if surface_id in bindings_by_branch[branch_index]],
+                }
                 for scene in scene_summary
             ],
         }
@@ -619,6 +706,7 @@ def run_tracker(
             "scene_count": len(scene_summary),
             "scenes": scene_summary,
             "branch_scene_surface_map": branch_scene_surface_map,
+            "asset_bindings": normalized_bindings,
         },
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -631,6 +719,7 @@ def main():
     parser.add_argument("--quad", type=Path, help="manual TL TR BR BL pixel coordinates")
     parser.add_argument("--quad-json", type=Path, help="JSON file containing quad corners")
     parser.add_argument("--surface-quad-json", type=Path, nargs="+", help="optional additional surface quad JSON files (up to four total surfaces)")
+    parser.add_argument("--asset-binding-json", type=Path, help="JSON array mapping branch_index to surface_ids")
     parser.add_argument("--signs", type=Path, nargs="+", required=True, metavar="PNG")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--max-frames", type=int, default=0)
@@ -653,6 +742,12 @@ def main():
         surface_quads = [read_quad(path) for path in args.surface_quad_json]
         if quad_arg and not any(np.array_equal(parse_quad(quad_arg), surface) for surface in surface_quads):
             surface_quads.insert(0, parse_quad(quad_arg))
+    asset_bindings = None
+    if args.asset_binding_json:
+        raw_bindings = json.loads(args.asset_binding_json.read_text(encoding="utf-8"))
+        if not isinstance(raw_bindings, list):
+            raise ValueError("--asset-binding-json must contain a JSON array")
+        asset_bindings = raw_bindings
 
     summary = run_tracker(
         video=args.video,
@@ -668,6 +763,7 @@ def main():
         initialization_mode=mode,
         model_name=args.model_name,
         surface_quads=surface_quads,
+        asset_bindings=asset_bindings,
     )
     print(json.dumps(summary, indent=2))
 

@@ -25,6 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const metricSurfaces = document.getElementById('metric-surfaces');
   const sceneReviewControls = document.getElementById('scene-review-controls');
   const scenePicker = document.getElementById('review-scene-picker');
+  const surfacePicker = document.getElementById('review-surface-picker');
   const sceneReviewSummary = document.getElementById('scene-review-summary');
 
   let branchInputs = [];
@@ -34,8 +35,10 @@ document.addEventListener('DOMContentLoaded', () => {
   let reviewBackground = null;
   let reviewScenes = [];
   let activeSceneId = null;
+  let activeSurfaceIndex = 0;
   let reviewPreviewUrl = null;
   const sceneQuads = new Map();
+  const sceneSurfaces = new Map();
   let previewRenderToken = 0;
 
   function addBranchInput() {
@@ -117,7 +120,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function drawVideoFirstFrame(file, quad = null, frameIndex = 0) {
+  function drawSurfaceOverlays(ctx, surfaces, activeIndex = -1) {
+    (surfaces || []).forEach((surface, index) => {
+      if (surface && surface.quad) drawQuadOverlay(ctx, surface.quad, index === activeIndex);
+    });
+  }
+
+  function drawVideoFirstFrame(file, quad = null, frameIndex = 0, surfaces = null) {
     const renderToken = ++previewRenderToken;
     const video = document.createElement('video');
     video.preload = 'metadata';
@@ -145,12 +154,13 @@ document.addEventListener('DOMContentLoaded', () => {
       reviewBackground.width = previewCanvas.width;
       reviewBackground.height = previewCanvas.height;
       reviewBackground.getContext('2d').drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-      drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
+      if (surfaces && surfaces.length) drawSurfaceOverlays(ctx, surfaces, activeSurfaceIndex);
+      else drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
       URL.revokeObjectURL(video.src);
     };
   }
 
-  function drawSampleFrame(url, quad) {
+  function drawSampleFrame(url, quad, surfaces = null) {
     const renderToken = ++previewRenderToken;
     const image = new Image();
     image.onload = () => {
@@ -170,7 +180,8 @@ document.addEventListener('DOMContentLoaded', () => {
       reviewBackground.width = image.width;
       reviewBackground.height = image.height;
       reviewBackground.getContext('2d').drawImage(image, 0, 0);
-      drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
+      if (surfaces && surfaces.length) drawSurfaceOverlays(ctx, surfaces, activeSurfaceIndex);
+      else drawQuadOverlay(ctx, resolvedQuad, Boolean(reviewPanel && !reviewPanel.hidden));
     };
     image.src = url;
   }
@@ -194,6 +205,19 @@ document.addEventListener('DOMContentLoaded', () => {
       if (quad && quad.every(point => point.every(Number.isFinite))) return quad;
     }
     return null;
+  }
+
+  function candidateSurfaces(scene) {
+    const source = scene && Array.isArray(scene.surfaces) && scene.surfaces.length
+      ? scene.surfaces
+      : (scene && Array.isArray(scene.candidates) ? scene.candidates : []);
+    const surfaces = source.map((item, index) => ({
+      surface_id: String(item.surface_id || `${sceneKey(scene)}_surface_${String(index + 1).padStart(3, '0')}`),
+      quad: cloneQuad(item.quad || item.pixel_quad),
+    })).filter(item => item.quad);
+    if (surfaces.length) return surfaces;
+    const fallback = candidateQuad(scene);
+    return fallback ? [{ surface_id: `${sceneKey(scene)}_surface_001`, quad: fallback }] : [];
   }
 
   function centeredQuad() {
@@ -240,16 +264,18 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const surface = Array.isArray(scene.surfaces) ? scene.surfaces[0] : null;
     const surfaceStatus = surface && surface.status ? ` · 平面 ${sceneStatus(surface)}` : '';
-    sceneReviewSummary.textContent = `${sceneRange(scene)} · 初始化 ${sceneInitMode(scene)} · ${sceneStatus(scene)}${surfaceStatus}`;
+    const surfaceCount = candidateSurfaces(scene).length;
+    sceneReviewSummary.textContent = `${sceneRange(scene)} · 初始化 ${sceneInitMode(scene)} · ${sceneStatus(scene)} · ${surfaceCount || 0} 个平面${surfaceStatus}`;
     const reasons = (scene.validation && scene.validation.reasons) || (scene.candidate && scene.candidate.validation && scene.candidate.validation.reasons);
     reviewReasons.textContent = (reasons && reasons.length) ? reasons.join('、') : (sceneStatus(scene) === '需确认' ? '该场景的候选需要人工确认。' : '请检查招牌四角后提交。');
   }
 
   function drawReviewScene(scene) {
     const quad = activeSceneId == null ? reviewQuad : sceneQuads.get(String(activeSceneId));
+    const surfaces = activeSceneId == null ? null : sceneSurfaces.get(String(activeSceneId));
     const preview = scenePreview(scene) || reviewPreviewUrl;
-    if (preview) drawSampleFrame(preview, quad);
-    else if (videoInput.files[0]) drawVideoFirstFrame(videoInput.files[0], quad, scene && scene.start_frame);
+    if (preview) drawSampleFrame(preview, quad, surfaces);
+    else if (videoInput.files[0]) drawVideoFirstFrame(videoInput.files[0], quad, scene && scene.start_frame, surfaces);
     else {
       previewRenderToken += 1;
       reviewBackground = null;
@@ -259,7 +285,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function saveActiveSceneQuad() {
-    if (activeSceneId != null && reviewQuad) sceneQuads.set(String(activeSceneId), cloneQuad(reviewQuad));
+    if (activeSceneId == null || !reviewQuad) return;
+    const surfaces = sceneSurfaces.get(String(activeSceneId));
+    if (surfaces && surfaces[activeSurfaceIndex]) {
+      surfaces[activeSurfaceIndex].quad = cloneQuad(reviewQuad);
+      if (activeSurfaceIndex === 0) sceneQuads.set(String(activeSceneId), cloneQuad(reviewQuad));
+    } else {
+      sceneQuads.set(String(activeSceneId), cloneQuad(reviewQuad));
+    }
   }
 
   function switchReviewScene(sceneId) {
@@ -267,7 +300,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const scene = reviewScenes.find(item => sceneKey(item) === String(sceneId));
     if (!scene) return;
     activeSceneId = sceneKey(scene);
+    activeSurfaceIndex = 0;
     reviewQuad = cloneQuad(sceneQuads.get(activeSceneId));
+    if (surfacePicker) {
+      const surfaces = sceneSurfaces.get(activeSceneId) || [];
+      surfacePicker.innerHTML = '';
+      surfaces.forEach((surface, index) => {
+        const option = document.createElement('option');
+        option.value = String(index);
+        option.textContent = `${surface.surface_id} · 平面 ${index + 1}`;
+        surfacePicker.appendChild(option);
+      });
+      surfacePicker.value = '0';
+    }
     if (scenePicker && scenePicker.value !== activeSceneId) scenePicker.value = activeSceneId;
     drawReviewScene(scene);
   }
@@ -275,14 +320,18 @@ document.addEventListener('DOMContentLoaded', () => {
   function setupSceneReview(job) {
     reviewScenes = Array.isArray(job.scenes) ? job.scenes.slice(0, 2) : [];
     sceneQuads.clear();
+    sceneSurfaces.clear();
     activeSceneId = null;
     if (!reviewScenes.length) {
       if (sceneReviewControls) sceneReviewControls.hidden = true;
       return false;
     }
     reviewScenes.forEach(scene => {
-      const quad = candidateQuad(scene);
-      if (quad) sceneQuads.set(sceneKey(scene), quad);
+      const surfaces = candidateSurfaces(scene);
+      if (surfaces.length) {
+        sceneSurfaces.set(sceneKey(scene), surfaces);
+        sceneQuads.set(sceneKey(scene), surfaces[0].quad);
+      }
     });
     if (sceneReviewControls) sceneReviewControls.hidden = false;
     if (scenePicker) {
@@ -304,7 +353,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const ctx = previewCanvas.getContext('2d');
     ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
     ctx.drawImage(reviewBackground, 0, 0, previewCanvas.width, previewCanvas.height);
-    drawQuadOverlay(ctx, reviewQuad, true);
+    const surfaces = activeSceneId == null ? null : sceneSurfaces.get(String(activeSceneId));
+    if (surfaces && surfaces.length) drawSurfaceOverlays(ctx, surfaces, activeSurfaceIndex);
+    else drawQuadOverlay(ctx, reviewQuad, true);
   }
 
   function updateMetrics(summary, mode, job = null) {
@@ -375,6 +426,17 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   previewCanvas.addEventListener('pointerup', () => { dragIndex = -1; });
 
+  if (surfacePicker) {
+    surfacePicker.addEventListener('change', () => {
+      activeSurfaceIndex = Math.max(0, Number(surfacePicker.value) || 0);
+      const surfaces = activeSceneId == null ? [] : (sceneSurfaces.get(String(activeSceneId)) || []);
+      if (surfaces[activeSurfaceIndex]) {
+        reviewQuad = cloneQuad(surfaces[activeSurfaceIndex].quad);
+        redrawReview();
+      }
+    });
+  }
+
   async function pollJob(jobId) {
     activeJobId = jobId;
     localStorage.setItem('franchiseflow_job_id', jobId);
@@ -412,11 +474,13 @@ document.addEventListener('DOMContentLoaded', () => {
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const files = branchInputs.map(input => input.files[0]).filter(Boolean);
-    if (!videoInput.files[0]) return alert('请先选择 MP4 门店视频');
+    if (!videoInput.files[0]) return alert('请先选择门店视频');
     if (!files.length) return alert('请至少选择一张分支招牌图片');
     const formData = new FormData();
     formData.append('video', videoInput.files[0]);
     files.forEach(file => formData.append('branches', file));
+    const targetHint = document.getElementById('target-hint-input');
+    if (targetHint && targetHint.value.trim()) formData.append('target_hint', targetHint.value.trim());
     const manual = document.getElementById('mode-manual').checked;
     formData.append('use_manual_quad', manual ? 'true' : 'false');
     btnSubmit.disabled = true;
@@ -441,8 +505,12 @@ document.addEventListener('DOMContentLoaded', () => {
   reviewButton.addEventListener('click', async () => {
     if (!activeJobId || !reviewQuad) return;
     saveActiveSceneQuad();
-    const payload = reviewScenes.length > 1
-      ? { scenes: reviewScenes.map(scene => ({ scene_id: sceneKey(scene), quad: sceneQuads.get(sceneKey(scene)) || centeredQuad() })) }
+    const payload = reviewScenes.length
+      ? { scenes: reviewScenes.map(scene => ({
+          scene_id: sceneKey(scene),
+          surfaces: (sceneSurfaces.get(sceneKey(scene)) || [{ surface_id: `${sceneKey(scene)}_surface_001`, quad: sceneQuads.get(sceneKey(scene)) || centeredQuad() }])
+            .map(surface => ({ surface_id: surface.surface_id, quad: surface.quad })),
+        })) }
       : { quad: reviewQuad };
     reviewButton.disabled = true;
     try {

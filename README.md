@@ -4,7 +4,7 @@
 
 FranchiseFlow 面向连锁品牌的视频本地化制作。用户上传一条连续门店运镜视频和若干分店招牌图片，系统先让视觉模型提出平面候选，再用三帧检查判断候选能否交给本地几何跟踪器。候选不可靠时，页面展示原因并允许拖动四个角点确认。
 
-当前产品原型支持 720p、15 秒以内的视频，自动识别最多 2 个高置信度硬切场景；每个场景先处理一个主要平面招牌，分支数量为 1 到 10 个。前景遮挡抠像、软切和 3D 网格仍需人工流程或后续版本。
+当前产品原型支持 720p、15 秒以内的视频，自动识别最多 2 个高置信度硬切场景；每个场景最多处理 4 个经过验证且互不重叠的平面，分支数量为 1 到 10 个。多平面任务会记录每个分支使用哪些平面，候选有歧义时进入人工复核。前景遮挡抠像、软切和 3D 网格仍需后续版本。
 
 ## Pipeline
 
@@ -36,7 +36,9 @@ python -m pip install -r requirements.txt
 python prototype/franchiseflow/app.py
 ```
 
-打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；候选需要人工确认时，提交四角到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口。服务会拒绝超过 250 MiB 的上传或超过 15 秒的视频。
+打开 `http://127.0.0.1:5000/`。页面支持动态添加分支，最多 10 张图片，也可以填入品牌名或招牌外观提示帮助视觉定位。任务通过 `POST /api/jobs` 创建，使用 `GET /api/jobs/<job_id>` 查询状态；候选需要人工确认时，提交四角或 `surfaces[]` 到 `POST /api/jobs/<job_id>/review`，完成后从 `GET /api/jobs/<job_id>/outputs` 获取结果。旧的 `POST /api/render` 仍保留为同步兼容入口。服务会拒绝超过 250 MiB 的上传或超过 15 秒的视频。
+
+视频输入支持 `.mp4`、`.mov`、`.m4v`、`.webm`、`.avi` 和 `.mkv`。非 MP4 源以及检测到 HEVC、H.265、ProRes 或 AV1 的 MP4 会在任务创建时保留原文件，并用 FFmpeg 生成 `processing_input.mp4`（H.264、`yuv420p`、可选 AAC 音轨）供 OpenCV 和跟踪器使用。任务 JSON 与 `manifest.json` 会记录原始扩展名、工作文件名和解码器可见的尺寸、帧率、时长估计；场景采样阶段再顺序解码并记录实际帧数。
 
 ### API key
 
@@ -82,7 +84,7 @@ python spikes/franchiseflow/tracker.py \
 
 ## Scene / Surface 实验接口
 
-跟踪器已经提供最多四个独立平面的实验参数 `--surface-quad-json`，Web 任务使用最多两个硬切场景的清单。每个平面拥有自己的 SIFT/RANSAC/LK 跟踪器，单个平面失效时只保留该平面的原画，其他平面继续处理。软切、遮挡抠像和跨镜头自动匹配仍需单独验证。
+跟踪器已经提供最多四个独立平面的实验参数 `--surface-quad-json` 和 `--asset-binding-json`。Web 任务使用最多两个硬切场景的清单，每个场景最多四个平面。每个平面拥有自己的 SIFT/RANSAC/LK 跟踪器，单个平面失效时只保留该平面的原画，其他平面继续处理。一个分支可以显式引用多个平面，多个分支也可以分别引用同一个平面。软切、遮挡抠像和跨镜头自动匹配仍需单独验证。
 
 ## Tests
 
@@ -97,7 +99,7 @@ git grep -n -I -E 'sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}' --
 
 ## Known limitations
 
-真实样例中，`gemini-3.1-flash-image` 可能把倾斜立面的砖墙、窗户或门洞混入四边形。系统会把这种候选交给三帧验证和人工确认，不把人工 `quad.json` 冒充模型定位结果。视觉模型的默认提示词包含样例招牌文字 `STATE OF CONFUSION`，但没有写入样例像素坐标。
+真实样例中，`gemini-3.1-flash-image` 可能把倾斜立面的砖墙、窗户或门洞混入四边形。系统会把这种候选交给三帧验证和人工确认，不把人工 `quad.json` 冒充模型定位结果。视觉模型的默认提示词只描述通用的平面招牌；用户可以通过 `target_hint` 传入品牌名或招牌外观描述，避免把演示素材的文字当成通用规则。
 
 ## Credits
 

@@ -169,13 +169,115 @@ class TrackerSyntheticTests(unittest.TestCase):
         quad_a = np.float32([[100, 100], [300, 100], [300, 250], [100, 250]])
         quad_b = np.float32([[360, 100], [600, 100], [600, 250], [360, 250]])
 
-        summary = run_tracker(video_path, quad_a, [sign], self.temp_dir / "two_surface_out", no_debug=True, surface_quads=[quad_a, quad_b])
+        summary = run_tracker(
+            video_path,
+            quad_a,
+            [sign],
+            self.temp_dir / "two_surface_out",
+            no_debug=True,
+            surface_quads=[quad_a, quad_b],
+            asset_bindings=[{"branch_index": 1, "surface_ids": ["surface_001", "surface_002"], "fit": "cover"}],
+        )
 
         self.assertEqual(summary["surface_count"], 2)
         self.assertEqual(summary["branch_count"], 1)
         records = [json.loads(line) for line in (self.temp_dir / "two_surface_out" / "tracking.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(records[0]["surface_details"]), 2)
         self.assertEqual(len(summary["output_videos"]), 1)
+
+    def test_asset_bindings_render_each_branch_only_on_owned_surface(self):
+        video_path = self.temp_dir / "bound_surfaces.mp4"
+        frame = _create_textured_image()
+        for y in range(80, 260, 20):
+            for x in range(360, 600, 20):
+                color = (int((x + y) % 220), 70 + (x % 150), 210)
+                cv2.rectangle(frame, (x, y), (x + 18, y + 18), color, -1)
+                cv2.putText(frame, f"{x},{y}", (x + 2, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 255), 1)
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (640, 480))
+        writer.write(frame)
+        writer.write(frame)
+        writer.release()
+        sign_one = self.temp_dir / "sign_one.png"
+        sign_two = self.temp_dir / "sign_two.png"
+        cv2.imwrite(str(sign_one), np.full((100, 200, 4), (0, 0, 255, 255), dtype=np.uint8))
+        cv2.imwrite(str(sign_two), np.full((100, 200, 4), (0, 255, 0, 255), dtype=np.uint8))
+        quad_a = np.float32([[100, 100], [300, 100], [300, 250], [100, 250]])
+        quad_b = np.float32([[360, 100], [600, 100], [600, 250], [360, 250]])
+
+        summary = run_tracker(
+            video_path,
+            quad_a,
+            [sign_one, sign_two],
+            self.temp_dir / "bound_surface_out",
+            no_debug=True,
+            surface_quads=[quad_a, quad_b],
+            asset_bindings=[
+                {"branch_index": 1, "surface_ids": ["surface_001"], "fit": "cover"},
+                {"branch_index": 2, "surface_ids": ["surface_002"], "fit": "cover"},
+            ],
+        )
+        self.assertEqual(summary["asset_bindings"][0]["surface_ids"], ["surface_001"])
+        self.assertEqual(summary["branch_scene_surface_map"][0]["scenes"][0]["surface_ids"], ["surface_001"])
+        self.assertEqual(summary["branch_scene_surface_map"][1]["scenes"][0]["surface_ids"], ["surface_002"])
+        output_one = cv2.VideoCapture(str(self.temp_dir / "bound_surface_out" / "branch_1_sign_one.mp4"))
+        output_two = cv2.VideoCapture(str(self.temp_dir / "bound_surface_out" / "branch_2_sign_two.mp4"))
+        ok_one, frame_one = output_one.read()
+        ok_two, frame_two = output_two.read()
+        output_one.release()
+        output_two.release()
+        self.assertTrue(ok_one and ok_two)
+        center_a = (175, 200)
+        center_b = (175, 480)
+        original_a = frame[center_a]
+        original_b = frame[center_b]
+        self.assertGreater(int(frame_one[center_a][2]), 180)
+        self.assertGreater(int(frame_two[center_b][1]), 180)
+        self.assertLess(float(np.linalg.norm(frame_one[center_b].astype(float) - original_b)), 45.0)
+        self.assertLess(float(np.linalg.norm(frame_two[center_a].astype(float) - original_a)), 45.0)
+
+        shared = run_tracker(
+            video_path,
+            quad_a,
+            [sign_one, sign_two],
+            self.temp_dir / "shared_surface_out",
+            no_debug=True,
+            surface_quads=[quad_a, quad_b],
+            asset_bindings=[
+                {"branch_index": 1, "surface_ids": ["surface_001"], "fit": "cover"},
+                {"branch_index": 2, "surface_ids": ["surface_001"], "fit": "cover"},
+            ],
+        )
+        self.assertEqual(shared["branch_scene_surface_map"][0]["scenes"][0]["surface_ids"], ["surface_001"])
+        self.assertEqual(shared["branch_scene_surface_map"][1]["scenes"][0]["surface_ids"], ["surface_001"])
+
+    def test_multi_surface_requires_non_overlapping_explicit_bindings(self):
+        video_path, quad, signs, _ = self._create_synthetic_fixture(num_frames=2, blank_frame_idx=-1)
+        quad_b = np.float32([[230, 100], [390, 100], [390, 220], [230, 220]])
+        with self.assertRaisesRegex(ValueError, "asset_bindings are required"):
+            run_tracker(video_path, quad, signs[:1], self.temp_dir / "missing_bindings", no_debug=True, surface_quads=[quad, quad_b])
+        with self.assertRaisesRegex(ValueError, "repeats a surface_id"):
+            run_tracker(
+                video_path,
+                quad,
+                signs[:2],
+                self.temp_dir / "duplicate_bindings",
+                no_debug=True,
+                surface_quads=[quad, quad_b],
+                asset_bindings=[
+                    {"branch_index": 1, "surface_ids": ["surface_001", "surface_001"]},
+                    {"branch_index": 2, "surface_ids": ["surface_001"]},
+                ],
+            )
+        with self.assertRaisesRegex(ValueError, "unknown surface"):
+            run_tracker(
+                video_path,
+                quad,
+                signs[:1],
+                self.temp_dir / "unknown_binding",
+                no_debug=True,
+                surface_quads=[quad, quad_b],
+                asset_bindings=[{"branch_index": 1, "surface_ids": ["missing_surface"]}],
+            )
 
     def test_run_tracker_supports_two_hard_cut_scenes_with_stable_ids(self):
         """A scene reset must use that scene's source frame and keep the timeline."""

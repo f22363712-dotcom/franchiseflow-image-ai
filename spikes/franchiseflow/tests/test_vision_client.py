@@ -87,6 +87,59 @@ class VisionClientParsingTests(unittest.TestCase):
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(result["candidates"][0]["quad"][2], [900.0, 250.0])
 
+    def test_prompt_is_brand_agnostic_and_includes_target_hint(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [{
+                "quad": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.5], [0.1, 0.5]],
+                "confidence": 0.91,
+            }]
+        })}}]}
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(payload).encode()
+
+        def capture_request(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch("vision_client.urllib.request.urlopen", side_effect=capture_request):
+            VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(
+                b"jpeg", 1000, 500, target_hint="Acme Coffee neon fascia"
+            )
+
+        prompt = captured["payload"]["messages"][0]["content"][0]["text"]
+        self.assertIn("Acme Coffee neon fascia", prompt)
+        self.assertIn("Find every clearly visible physical planar storefront sign or flat advertising board", prompt)
+        self.assertNotIn("STATE OF CONFUSION", prompt)
+
+    def test_default_prompt_has_no_demo_brand_anchor(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [{"quad": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.5], [0.1, 0.5]]}]
+        })}}]}
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, _limit): return json.dumps(payload).encode()
+
+        def capture_request(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch("vision_client.urllib.request.urlopen", side_effect=capture_request):
+            VisionClient(api_key="test-key", base_url="https://example.test/v1").locate_candidates(b"jpeg", 1000, 500)
+        prompt = captured["payload"]["messages"][0]["content"][0]["text"]
+        self.assertNotIn("STATE OF CONFUSION", prompt)
+
     def test_rejects_response_with_any_mixed_coordinate_candidate(self):
         payload = {"choices": [{"message": {"content": json.dumps({
             "candidates": [

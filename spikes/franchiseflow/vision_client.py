@@ -108,10 +108,14 @@ class VisionClient:
     def locate_candidates(self, image_bytes: bytes, width: int, height: int, target_hint: str | None = None, mime: str = "image/jpeg") -> dict[str, Any]:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         prompt = "Find every clearly visible physical planar storefront sign or flat advertising board in this image. "
+        # The locator is intentionally brand-agnostic.  A concrete brand or
+        # sign description is supplied by the caller when it is known; the
+        # default must not anchor the model to the demo fixture's wording.
         if target_hint:
-            prompt += f"Target description: {target_hint}. "
+            hint = str(target_hint).strip()[:500]
+            prompt += f"Target description supplied by the user: {hint}. "
         else:
-            prompt += "Target: the primary storefront sign (e.g. the dark gray board with 'STATE OF CONFUSION'). "
+            prompt += "Target: the primary storefront sign or flat advertising board. "
         prompt += (
             "Return only JSON with key candidates. candidates must be an array of objects with quad, confidence, and reason. "
             "quad must be four image pixel corners in clockwise order [top-left, top-right, bottom-right, bottom-left]. "

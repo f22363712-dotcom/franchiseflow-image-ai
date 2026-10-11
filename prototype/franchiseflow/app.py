@@ -27,6 +27,13 @@ from job_store import create_job, load_job, save_job
 from tracker import parse_quad, run_tracker
 from scene_samples import sample_video_scenes
 from vision_client import VisionClient
+from input_media import (
+    SUPPORTED_SOURCE_EXTS,
+    inspect_video,
+    normalize_video_for_processing,
+    probe_video_codec,
+    source_requires_normalization,
+)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -35,7 +42,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_VIDEO_EXTS = {".mp4"}
+ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 MAX_BRANCHES = 10
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
@@ -43,6 +50,8 @@ MAX_VIDEO_SECONDS = 15.0
 MAX_ACTIVE_JOBS = 4
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_IMAGE_PIXELS = 20_000_000
+MAX_SURFACES_PER_SCENE = 4
+SURFACE_OVERLAP_THRESHOLD = 0.25
 
 # Reject oversized multipart bodies before Werkzeug spools them to disk. The
 # small allowance covers multipart headers and form fields; the exact payload
@@ -87,12 +96,16 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "video_file": job.get("video_file"),
+        "processing_video_file": job.get("processing_video_file"),
+        "video_metadata": job.get("video_metadata"),
         "branch_files": job.get("branch_files", []),
         "branch_count": job.get("branch_count"),
         "initialization_mode": job.get("initialization_mode"),
         "model": job.get("model"),
         "target_hint": job.get("target_hint"),
         "candidate": job.get("candidate"),
+        "candidates": job.get("candidates", []),
+        "asset_bindings": job.get("asset_bindings"),
         "reviewed_quad": job.get("reviewed_quad"),
         "vision_audit": job.get("vision_audit"),
         "scenes": job.get("scenes", []),
@@ -230,7 +243,8 @@ def _create_job_from_request() -> dict[str, Any]:
     if video_file is None or not video_file.filename:
         raise ValueError("Missing video file")
     if Path(video_file.filename).suffix.lower() not in ALLOWED_VIDEO_EXTS:
-        raise ValueError("Video must be an MP4 file")
+        allowed = ", ".join(sorted(ALLOWED_VIDEO_EXTS))
+        raise ValueError(f"Video must use a supported video extension: {allowed}")
 
     branch_files = _branch_files(request.files)
     if not 1 <= len(branch_files) <= MAX_BRANCHES:
@@ -255,18 +269,33 @@ def _create_job_from_request() -> dict[str, Any]:
             branch.save(str(upload_dir / name))
             branch_names.append(name)
 
-        video_path = upload_dir / video_name
+        source_video_path = upload_dir / video_name
+        # Keep the upload unchanged for audit.  Non-MP4 sources are converted
+        # once into a deterministic working asset so HEVC/MOV/WebM inputs do
+        # not depend on whatever codec support the local OpenCV build happens
+        # to have.  Existing MP4 flows retain their original path.
+        processing_video_name = video_name
+        source_codec = probe_video_codec(source_video_path)
+        if source_requires_normalization(source_video_path):
+            processing_video_name = "processing_input.mp4"
+            processing_path = upload_dir / processing_video_name
+            try:
+                normalize_video_for_processing(source_video_path, processing_path)
+            except RuntimeError as exc:
+                raise ValueError(f"video normalization failed: {exc}") from exc
+            if processing_path.stat().st_size > MAX_UPLOAD_BYTES:
+                raise ValueError("normalized video exceeds the upload size limit")
+        video_path = upload_dir / processing_video_name
         branch_paths = [upload_dir / name for name in branch_names]
-        total_bytes = video_path.stat().st_size + sum(path.stat().st_size for path in branch_paths)
+        total_bytes = source_video_path.stat().st_size + sum(path.stat().st_size for path in branch_paths)
         if total_bytes > MAX_UPLOAD_BYTES:
             raise ValueError(f"upload size exceeds the {MAX_UPLOAD_BYTES} byte limit")
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
-        cap.release()
-        if fps <= 0 or frame_count <= 0:
-            raise ValueError("unable to read uploaded video duration")
-        duration = frame_count / fps
+        video_metadata = inspect_video(video_path)
+        video_metadata["source_extension"] = source_video_path.suffix.lower()
+        video_metadata["processing_extension"] = video_path.suffix.lower()
+        video_metadata["source_codec"] = source_codec.get("codec_name")
+        video_metadata["source_pixel_format"] = source_codec.get("pix_fmt")
+        duration = float(video_metadata["duration_seconds_estimate"])
         if duration > MAX_VIDEO_SECONDS:
             raise ValueError(f"video duration {duration:.2f}s exceeds the {MAX_VIDEO_SECONDS:.2f}s limit")
         first_frame = _first_frame(video_path)
@@ -279,6 +308,15 @@ def _create_job_from_request() -> dict[str, Any]:
                 raise ValueError(f"branch image {path.name} exceeds the {MAX_IMAGE_PIXELS} pixel limit")
 
         manual = request.form.get("use_manual_quad", "false").lower() in {"true", "1", "yes"}
+        raw_asset_bindings = request.form.get("asset_bindings")
+        asset_bindings = None
+        if raw_asset_bindings:
+            try:
+                asset_bindings = json.loads(raw_asset_bindings)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid asset_bindings JSON: {exc}") from exc
+            if not isinstance(asset_bindings, list):
+                raise ValueError("asset_bindings must be a JSON array")
         manual_quad = None
         if manual:
             raw_quad = request.form.get("manual_quad")
@@ -306,10 +344,13 @@ def _create_job_from_request() -> dict[str, Any]:
         "status": "queued",
         "phase": "queued",
         "video_file": video_name,
+        "processing_video_file": processing_video_name,
+        "video_metadata": video_metadata,
         "branch_files": branch_names,
         "branch_count": len(branch_names),
         "initialization_mode": "manual_fallback" if manual else "vision_model",
         "manual_quad": manual_quad,
+        "asset_bindings": asset_bindings,
         "target_hint": request.form.get("target_hint") or None,
         "output_urls": [],
     })
@@ -320,7 +361,8 @@ def _create_job_from_request() -> dict[str, Any]:
 def _paths(job: dict[str, Any]) -> tuple[Path, list[Path], Path]:
     job_id = job["job_id"]
     upload_dir = UPLOAD_DIR / job_id
-    return upload_dir / job["video_file"], [upload_dir / name for name in job["branch_files"]], OUTPUT_DIR / job_id
+    processing_name = job.get("processing_video_file") or job["video_file"]
+    return upload_dir / processing_name, [upload_dir / name for name in job["branch_files"]], OUTPUT_DIR / job_id
 
 
 def _normalise_candidate(candidate: dict[str, Any], scale: float, panel_width: int | None = None, panel_count: int | None = None) -> dict[str, Any]:
@@ -345,13 +387,80 @@ def _normalise_candidate(candidate: dict[str, Any], scale: float, panel_width: i
     return result
 
 
-def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]], sample_dir: Path, target_hint: str | None) -> tuple[dict[str, Any] | None, dict[str, Any], str, dict[str, Any]]:
+def _quad_overlap_ratio(first: list | np.ndarray, second: list | np.ndarray) -> float:
+    """Return intersection area divided by the smaller quad area.
+
+    A high ratio means the model likely returned the same physical surface
+    twice.  We refuse to choose between such candidates automatically.
+    """
+    first_points = parse_quad(first).astype(np.float32)
+    second_points = parse_quad(second).astype(np.float32)
+    first_area = abs(float(cv2.contourArea(first_points)))
+    second_area = abs(float(cv2.contourArea(second_points)))
+    if min(first_area, second_area) <= 0.0:
+        return 1.0
+    try:
+        intersection, _ = cv2.intersectConvexConvex(first_points, second_points)
+    except cv2.error:
+        return 1.0
+    return max(0.0, min(1.0, float(intersection) / min(first_area, second_area)))
+
+
+def _stable_candidate_key(candidate: dict[str, Any]) -> tuple[float, float, float, str]:
+    points = np.asarray(candidate["quad"], dtype=np.float32)
+    return (
+        round(float(np.min(points[:, 1])), 3),
+        round(float(np.min(points[:, 0])), 3),
+        -round(float(candidate.get("confidence", 0.0)), 6),
+        json.dumps(candidate["quad"], separators=(",", ":")),
+    )
+
+
+def _review_candidate_error(
+    candidates: list[dict[str, Any]],
+    model: str,
+    audit: dict[str, Any],
+    reason: str,
+    validations: list[dict[str, Any]] | None = None,
+) -> "CandidateReviewRequired":
+    validation = {
+        "accepted": False,
+        "requires_human_review": True,
+        "reasons": [reason],
+        "candidate_validations": validations or [],
+    }
+    audit["validation_reasons"] = [reason]
+    audit["requires_human_review"] = True
+    return CandidateReviewRequired(
+        candidates[0] if candidates else None,
+        validation,
+        model,
+        audit,
+        candidates=candidates,
+        validations=validations or [],
+    )
+
+
+def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]], sample_dir: Path, target_hint: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, dict[str, Any]]:
     contact_sheet, panel_width, panel_height, scale = _save_contact_sheet(samples, sample_dir)
     first_height, first_width = samples[0][1].shape[:2]
     client = VisionClient()
     panel_count = len(samples)
     sheet_width = panel_width * panel_count
-    result = client.locate_candidates(contact_sheet, sheet_width, panel_height, target_hint=target_hint)
+    try:
+        result = client.locate_candidates(contact_sheet, sheet_width, panel_height, target_hint=target_hint)
+    except RuntimeError as exc:
+        # Invalid/no-candidate model output is recoverable by drawing a quad in
+        # the review UI.  Network/authentication failures remain hard errors.
+        message = str(exc)
+        if message.startswith("vision_failed: invalid candidate response") or message.startswith("vision model could not find a replaceable planar sign"):
+            audit = {
+                "input_sha256": hashlib.sha256(contact_sheet).hexdigest(),
+                "candidate_count": 0,
+                "model": str(getattr(client, "model", "unknown")),
+            }
+            raise _review_candidate_error([], audit["model"], audit, message) from exc
+        raise
     # Keep old mocked clients and old gateways usable during migration.
     if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
         encoded_first = cv2.imencode(".jpg", samples[0][1])[1].tobytes()
@@ -364,55 +473,117 @@ def _locate_and_validate(video_path: Path, samples: list[tuple[int, np.ndarray]]
         "model": str(result.get("model", client.model)),
     }
 
-    rejected: list[dict[str, Any]] = []
+    model = str(result.get("model", client.model))
+    raw_candidates = result["candidates"]
+    if not raw_candidates:
+        raise _review_candidate_error([], model, audit, "the model returned no candidates")
+    candidates: list[dict[str, Any]] = []
     for raw_candidate in result["candidates"]:
         try:
             candidate = _normalise_candidate(raw_candidate, scale, panel_width=panel_width, panel_count=panel_count)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"vision_failed: invalid contact-sheet candidate: {exc}") from exc
-        validation = validate_candidate(samples, candidate)
-        if validation["accepted"]:
-            audit["accepted_candidate_confidence"] = candidate.get("confidence")
-            audit["validation_reasons"] = validation.get("reasons", [])
-            return candidate, validation, str(result.get("model", client.model)), audit
-        rejected.append({"candidate": candidate, "validation": validation})
+            audit["candidate_count"] = len(raw_candidates)
+            raise _review_candidate_error([], model, audit, f"invalid contact-sheet candidate: {exc}") from exc
+        candidates.append(candidate)
 
-    if rejected:
-        best = max(rejected, key=lambda item: float(item["candidate"].get("confidence", 0.0)))
-        audit["validation_reasons"] = best["validation"].get("reasons", [])
-        raise CandidateReviewRequired(best["candidate"], best["validation"], str(result.get("model", client.model)), audit)
-    raise RuntimeError("vision_failed: the model returned no valid candidates")
+    audit["candidate_count"] = len(candidates)
+    if len(candidates) > MAX_SURFACES_PER_SCENE:
+        raise _review_candidate_error(candidates, model, audit, f"more than {MAX_SURFACES_PER_SCENE} candidate surfaces")
+
+    validations: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            validation = validate_candidate(samples, candidate)
+        except (TypeError, ValueError, cv2.error) as exc:
+            validation = {
+                "accepted": False,
+                "requires_human_review": True,
+                "reasons": [f"candidate validation failed: {exc}"],
+                "sample_metrics": [],
+            }
+        validations.append(validation)
+    if any(not item.get("accepted") for item in validations):
+        reasons = [reason for item in validations for reason in item.get("reasons", [])]
+        raise _review_candidate_error(candidates, model, audit, "; ".join(reasons) or "one or more candidates failed validation", validations)
+
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1:]:
+            overlap = _quad_overlap_ratio(left["quad"], right["quad"])
+            if overlap >= SURFACE_OVERLAP_THRESHOLD:
+                raise _review_candidate_error(
+                    candidates,
+                    model,
+                    audit,
+                    f"ambiguous candidate overlap ({overlap:.3f})",
+                    validations,
+                )
+
+    ordered = sorted(zip(candidates, validations), key=lambda item: _stable_candidate_key(item[0]))
+    candidates = [item[0] for item in ordered]
+    validations = [item[1] for item in ordered]
+    audit["accepted_candidate_count"] = len(candidates)
+    audit["surface_count"] = len(candidates)
+    audit["accepted_candidate_confidences"] = [item.get("confidence") for item in candidates]
+    audit["validation_reasons"] = [item.get("reasons", []) for item in validations]
+    return candidates, validations, model, audit
 
 
 class CandidateReviewRequired(RuntimeError):
-    def __init__(self, candidate: dict[str, Any], validation: dict[str, Any], model: str, audit: dict[str, Any]):
+    def __init__(self, candidate: dict[str, Any] | None, validation: dict[str, Any], model: str, audit: dict[str, Any], *, candidates: list[dict[str, Any]] | None = None, validations: list[dict[str, Any]] | None = None):
         super().__init__("candidate requires human review")
         self.candidate = candidate
+        self.candidates = candidates or ([candidate] if candidate else [])
+        self.validations = validations or []
         self.validation = validation
         self.model = model
         self.audit = audit
 
 
-def _scene_plan_entry(scene: dict[str, Any], quad: list | np.ndarray, *, mode: str, status: str = "validated", surface_id: str | None = None) -> dict[str, Any]:
+def _scene_plan_entry(
+    scene: dict[str, Any],
+    quad: list | np.ndarray | None = None,
+    *,
+    mode: str,
+    status: str = "validated",
+    surface_id: str | None = None,
+    surfaces: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Build the stable manifest consumed by the scene-aware tracker."""
-    points = parse_quad(quad).round(3).tolist()
     scene_id = str(scene["scene_id"])
+    if surfaces is None:
+        if quad is None:
+            raise ValueError("scene plan requires quad or surfaces")
+        surfaces = [{"quad": quad, "surface_id": surface_id}]
+    normalized_surfaces: list[dict[str, Any]] = []
+    for index, item in enumerate(surfaces, start=1):
+        points = parse_quad(item.get("quad", item.get("corners"))).round(3).tolist()
+        normalized_surfaces.append({
+            "surface_id": str(item.get("surface_id") or f"{scene_id}_surface_{index:03d}"),
+            "quad": points,
+            "initialization_mode": str(item.get("initialization_mode") or mode),
+            "status": str(item.get("status") or status),
+        })
     return {
         "scene_id": scene_id,
         "start_frame": int(scene["start_frame"]),
         "end_frame": int(scene["end_frame"]),
         "cut_before": scene.get("cut_before"),
         "cut_score": float(scene.get("cut_score", 0.0)),
-        "surfaces": [{
-            "surface_id": surface_id or f"{scene_id}_surface_001",
-            "quad": points,
-            "initialization_mode": mode,
-            "status": status,
-        }],
+        "surfaces": normalized_surfaces,
     }
 
 
-def _scene_view(scene: dict[str, Any], sample_preview: str, candidate: dict[str, Any] | None = None, validation: dict[str, Any] | None = None, *, status: str = "validated", mode: str = "vision_model") -> dict[str, Any]:
+def _scene_view(
+    scene: dict[str, Any],
+    sample_preview: str,
+    candidate: dict[str, Any] | None = None,
+    validation: dict[str, Any] | None = None,
+    *,
+    status: str = "validated",
+    mode: str = "vision_model",
+    candidates: list[dict[str, Any]] | None = None,
+    validations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Return JSON-only scene state for the API and browser review panel."""
     result = {
         "scene_id": scene["scene_id"],
@@ -424,21 +595,26 @@ def _scene_view(scene: dict[str, Any], sample_preview: str, candidate: dict[str,
         "initialization_mode": mode,
         "preview": sample_preview,
         "candidate": candidate,
+        "candidates": candidates or ([candidate] if candidate else []),
         "validation": validation,
+        "validations": validations or [],
         "surfaces": [],
     }
-    if candidate and candidate.get("quad"):
-        result["surfaces"] = [{
-            "surface_id": f"{scene['scene_id']}_surface_001",
-            "quad": candidate["quad"],
-            "status": status,
-            "initialization_mode": mode,
-        }]
+    candidate_items = candidates or ([candidate] if candidate else [])
+    result["surfaces"] = [{
+        "surface_id": f"{scene['scene_id']}_surface_{index:03d}",
+        "quad": item.get("quad"),
+        "status": status,
+        "initialization_mode": mode,
+        "candidate": item,
+        "validation": (validations[index - 1] if validations and index - 1 < len(validations) else validation),
+    } for index, item in enumerate(candidate_items, start=1) if item.get("quad")]
+    result["surface_count"] = len(result["surfaces"])
     return result
 
 
 def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: Path, target_hint: str | None, job_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, dict[str, Any]]:
-    """Locate one primary planar surface independently in each detected scene."""
+    """Locate up to four non-overlapping planar surfaces per scene."""
     views: list[dict[str, Any]] = []
     plan: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
@@ -447,14 +623,40 @@ def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: P
         scene_dir = sample_dir / scene["scene_id"]
         samples = scene["samples"]
         try:
-            candidate, validation, model, audit = _locate_and_validate(video_path, samples, scene_dir, target_hint)
+            candidates, validations, model, audit = _locate_and_validate(video_path, samples, scene_dir, target_hint)
         except CandidateReviewRequired as exc:
-            views.append(_scene_view(scene, f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg", exc.candidate, exc.validation, status="needs_review", mode="vision_model"))
+            views.append(_scene_view(
+                scene,
+                f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg",
+                exc.candidate,
+                exc.validation,
+                status="needs_review",
+                mode="vision_model",
+                candidates=exc.candidates,
+                validations=exc.validations,
+            ))
             audits.append(exc.audit)
             model_name = model_name or exc.model
             continue
-        views.append(_scene_view(scene, f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg", candidate, validation, status="validated", mode="vision_model"))
-        plan.append(_scene_plan_entry(scene, candidate["quad"], mode="vision_model"))
+        view = _scene_view(
+            scene,
+            f"/outputs/{job_id}/samples/{scene['scene_id']}/first.jpg",
+            candidates[0],
+            validations[0],
+            status="validated",
+            mode="vision_model",
+            candidates=candidates,
+            validations=validations,
+        )
+        views.append(view)
+        plan.append(_scene_plan_entry(
+            scene,
+            mode="vision_model",
+            surfaces=[
+                {"surface_id": f"{scene['scene_id']}_surface_{index:03d}", "quad": item["quad"], "status": "validated", "initialization_mode": "vision_model"}
+                for index, item in enumerate(candidates, start=1)
+            ],
+        ))
         audits.append(audit)
         model_name = model_name or model
     return views, plan, model_name, {
@@ -462,6 +664,65 @@ def _locate_scenes(video_path: Path, scenes: list[dict[str, Any]], sample_dir: P
         "scene_count": len(scenes),
         "candidate_count": sum(int(item.get("candidate_count", 0)) for item in audits),
     }
+
+
+def _review_surfaces_for_scene(
+    scene: dict[str, Any],
+    item: dict[str, Any],
+    video_path: Path,
+    used_surface_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Validate one scene's complete human surface selection."""
+    raw_surfaces = item.get("surfaces")
+    if raw_surfaces is None:
+        if item.get("quad") is None:
+            raise ValueError(f"missing review surfaces for {scene['scene_id']}")
+        raw_surfaces = [{"quad": item.get("quad")}]
+    if not isinstance(raw_surfaces, list) or not 1 <= len(raw_surfaces) <= MAX_SURFACES_PER_SCENE:
+        raise ValueError(f"review surfaces for {scene['scene_id']} must contain 1 to {MAX_SURFACES_PER_SCENE} items")
+
+    frame = _frame_at(video_path, int(scene["start_frame"]))
+    height, width = frame.shape[:2]
+    normalized: list[dict[str, Any]] = []
+    for index, raw_surface in enumerate(raw_surfaces, start=1):
+        if not isinstance(raw_surface, dict):
+            raise ValueError(f"review surface {index} for {scene['scene_id']} must be an object")
+        surface_id = str(raw_surface.get("surface_id") or f"{scene['scene_id']}_surface_{index:03d}")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", surface_id) or surface_id in used_surface_ids:
+            raise ValueError(f"review surface ID is invalid or duplicated: {surface_id}")
+        points = parse_quad(raw_surface.get("quad", raw_surface.get("corners")))
+        if (np.any(points[:, 0] < 0) or np.any(points[:, 0] >= width) or
+                np.any(points[:, 1] < 0) or np.any(points[:, 1] >= height)):
+            raise ValueError(f"review quad for {scene['scene_id']} lies outside its scene frame")
+        normalized.append({
+            "surface_id": surface_id,
+            "quad": points,
+            "status": "reviewed",
+            "initialization_mode": "reviewed_candidate",
+        })
+        used_surface_ids.add(surface_id)
+    for left_index, left in enumerate(normalized):
+        for right in normalized[left_index + 1:]:
+            overlap = _quad_overlap_ratio(left["quad"], right["quad"])
+            if overlap >= SURFACE_OVERLAP_THRESHOLD:
+                raise ValueError(f"review surfaces for {scene['scene_id']} overlap ({overlap:.3f})")
+    return normalized
+
+
+def _derive_asset_bindings(scene_plan: list[dict[str, Any]], branch_count: int) -> list[dict[str, Any]] | None:
+    """Derive the legacy-safe mapping when every branch targets every plane."""
+    counts = [len(scene.get("surfaces", [])) for scene in scene_plan]
+    if not counts or max(counts, default=1) <= 1:
+        return None
+    surface_ids = [surface["surface_id"] for scene in scene_plan for surface in scene.get("surfaces", [])]
+    return [
+        {
+            "branch_index": branch_index,
+            "surface_ids": surface_ids,
+            "fit": "cover",
+        }
+        for branch_index in range(1, branch_count + 1)
+    ]
 
 
 def _process_job(job_id: str) -> None:
@@ -528,7 +789,9 @@ def _process_job(job_id: str) -> None:
                     "vision_audit": vision_audit,
                     "model": model_name,
                     "candidate": first_unresolved.get("candidate"),
+                    "candidates": first_unresolved.get("candidates", []),
                     "validation": first_unresolved.get("validation"),
+                    "validations": first_unresolved.get("validations", []),
                     "error": "one or more scene candidates require human review",
                     "sample_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/first.jpg",
                     "contact_sheet_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/contact_sheet.jpg",
@@ -538,7 +801,14 @@ def _process_job(job_id: str) -> None:
             candidate = scene_views[0].get("candidate") if scene_views else None
             validation = scene_views[0].get("validation") if scene_views else None
             quad = parse_quad(candidate["quad"])
-            job.update({"candidate": candidate, "validation": validation, "model": model_name, "vision_audit": vision_audit})
+            job.update({
+                "candidate": candidate,
+                "candidates": scene_views[0].get("candidates", []),
+                "validation": validation,
+                "validations": scene_views[0].get("validations", []),
+                "model": model_name,
+                "vision_audit": vision_audit,
+            })
 
         job.update({
             "scenes": scene_views,
@@ -546,6 +816,9 @@ def _process_job(job_id: str) -> None:
             "sample_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/first.jpg",
             "contact_sheet_preview": f"/outputs/{job_id}/samples/{detected_scenes[0]['scene_id']}/contact_sheet.jpg",
         })
+        asset_bindings = job.get("asset_bindings") or _derive_asset_bindings(scene_plan or [], len(sign_paths))
+        if asset_bindings is not None:
+            job["asset_bindings"] = asset_bindings
         _set_job(job)
 
         job["phase"] = "tracking"
@@ -559,13 +832,26 @@ def _process_job(job_id: str) -> None:
             model_name=model_name,
             source_candidate=candidate,
             scene_plan=scene_plan or None,
+            asset_bindings=asset_bindings,
         )
         summary["scene_count"] = len(scene_plan) if scene_plan else len(detected_scenes)
         summary["surface_count"] = sum(len(scene["surfaces"]) for scene in scene_plan) if scene_plan else 1
         output_urls = [f"/outputs/{job_id}/{Path(path).name}" for path in summary.get("output_videos", [])]
         job.update({"status": "completed", "phase": "complete", "summary": _public_summary(summary), "outputs": output_urls, "output_urls": output_urls, "initialization_mode": mode})
     except CandidateReviewRequired as exc:
-        job.update({"status": "needs_review", "phase": "human_review", "candidate": exc.candidate, "validation": exc.validation, "model": exc.model, "vision_audit": exc.audit, "error": "candidate requires human review", "sample_preview": f"/outputs/{job_id}/samples/first.jpg", "contact_sheet_preview": f"/outputs/{job_id}/samples/contact_sheet.jpg"})
+        job.update({
+            "status": "needs_review",
+            "phase": "human_review",
+            "candidate": exc.candidate,
+            "candidates": exc.candidates,
+            "validation": exc.validation,
+            "validations": exc.validations,
+            "model": exc.model,
+            "vision_audit": exc.audit,
+            "error": "candidate requires human review",
+            "sample_preview": f"/outputs/{job_id}/samples/first.jpg",
+            "contact_sheet_preview": f"/outputs/{job_id}/samples/contact_sheet.jpg",
+        })
     except Exception as exc:
         message = str(exc)
         vision_error = message.startswith("vision_failed") or "vision gateway" in message.lower() or "candidate response" in message.lower()
@@ -656,7 +942,10 @@ def review_job(job_id: str):
     if _active_slot_count() >= MAX_ACTIVE_JOBS:
         return jsonify({"error": f"active job queue is full ({MAX_ACTIVE_JOBS} jobs); try again later"}), 429
     payload = request.get_json(silent=True) or {}
-    video_path = UPLOAD_DIR / job_id / job["video_file"]
+    requested_asset_bindings = payload.get("asset_bindings")
+    if requested_asset_bindings is not None and not isinstance(requested_asset_bindings, list):
+        return jsonify({"error": "asset_bindings must be a JSON array"}), 400
+    video_path = _paths(job)[0]
     scene_payload = payload.get("scenes")
     reviewed_plan: list[dict[str, Any]] | None = None
     quad: np.ndarray | None = None
@@ -670,17 +959,14 @@ def review_job(job_id: str):
             if len(by_id) != len(scene_payload):
                 raise ValueError("review scene IDs must be unique")
             reviewed_plan = []
+            used_surface_ids: set[str] = set()
             for scene in job["scenes"]:
                 scene_id = str(scene["scene_id"])
                 item = by_id.get(scene_id)
                 if item is None:
                     raise ValueError(f"missing review quad for {scene_id}")
-                points = parse_quad(item.get("quad"))
-                frame = _frame_at(video_path, int(scene["start_frame"]))
-                height, width = frame.shape[:2]
-                if np.any(points[:, 0] < 0) or np.any(points[:, 0] >= width) or np.any(points[:, 1] < 0) or np.any(points[:, 1] >= height):
-                    raise ValueError(f"review quad for {scene_id} lies outside its scene frame")
-                reviewed_plan.append(_scene_plan_entry(scene, points, mode="reviewed_candidate", status="reviewed"))
+                surfaces = _review_surfaces_for_scene(scene, item, video_path, used_surface_ids)
+                reviewed_plan.append(_scene_plan_entry(scene, mode="reviewed_candidate", surfaces=surfaces))
             quad = parse_quad(reviewed_plan[0]["surfaces"][0]["quad"])
         else:
             first_frame = _first_frame(video_path)
@@ -692,6 +978,8 @@ def review_job(job_id: str):
         return jsonify({"error": f"Invalid review quad: {exc}"}), 400
     previous = dict(job)
     job.update({"status": "queued", "phase": "queued", "initialization_mode": "reviewed_candidate", "manual_quad": quad.round(3).tolist(), "reviewed_quad": quad.round(3).tolist()})
+    if requested_asset_bindings is not None:
+        job["asset_bindings"] = requested_asset_bindings
     if reviewed_plan is not None:
         job["scene_plan"] = reviewed_plan
         job["scenes"] = [{**scene, "status": "validated", "initialization_mode": "reviewed_candidate", "surfaces": plan["surfaces"]}
@@ -754,6 +1042,15 @@ def get_demo_results():
     summary_path = demo_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
     summary = _public_summary(summary)
+    # This checked-in sample predates the current initialization enum and was
+    # produced from an explicit manual quad.  Keep the sample usable while
+    # reporting its provenance honestly to the UI and API consumers.
+    summary["initialization_mode"] = "manual_fallback"
+    summary["legacy_demo"] = True
+    summary.setdefault("asset_bindings", [
+        {"branch_index": index, "surface_ids": ["surface_001"], "fit": "cover"}
+        for index, _ in enumerate(sorted(demo_dir.glob("branch_*.mp4")), start=1)
+    ])
     job_id = "prebuilt_demo"
     target_job_dir = OUTPUT_DIR / job_id
     target_job_dir.mkdir(parents=True, exist_ok=True)
@@ -765,7 +1062,7 @@ def get_demo_results():
         "job_id": job_id,
         "status": "completed",
         "vision_quad": summary.get("first_frame_quad"),
-        "initialization_mode": summary.get("initialization_mode", "manual_fallback"),
+        "initialization_mode": "manual_fallback",
         "summary": summary,
         "outputs": outputs,
     }
