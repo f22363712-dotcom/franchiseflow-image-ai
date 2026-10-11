@@ -146,6 +146,11 @@
               <p>拖动当前平面的四个角点，再提交当前任务。多场景或多平面任务会一次提交所有复核结果。</p>
               <p class="review-disclosure">提交多平面任务时，当前界面会明确记录“每个分支素材应用到全部已复核平面”的映射；需要一块平面对应一个分支时，请通过 API 提交 <code>asset_bindings</code>。</p>
               <button type="button" id="review-quad" class="btn btn-primary">提交人工确认</button>
+              <div id="quality-review-controls" hidden style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid rgba(255,255,255,0.08);">
+                <p style="font-size:0.78rem;color:#fbbf24;">成片已经生成，但失败帧比例超过自动放行阈值。请先检查下方视频，再决定是否交付。</p>
+                <button type="button" id="quality-accept" class="btn btn-primary">接受并交付</button>
+                <button type="button" id="quality-reject" class="btn btn-outline">拒绝这批成片</button>
+              </div>
             </div>
             <div class="metric-item">
               <span class="metric-label">耗时 / 处理速度</span>

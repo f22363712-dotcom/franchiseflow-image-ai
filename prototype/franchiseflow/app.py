@@ -119,6 +119,7 @@ def _write_manifest(job: dict[str, Any]) -> None:
         "contact_sheet_preview": job.get("contact_sheet_preview"),
         "scene_plan": job.get("scene_plan", []),
         "outputs": job.get("outputs", []),
+        "quality_review": job.get("quality_review"),
         "summary": {
             key: value for key, value in summary.items()
             if key not in {"output_videos"}
@@ -1127,6 +1128,36 @@ def get_job_outputs(job_id: str):
     if job.get("status") != "completed":
         return jsonify({"error": "Job is not completed", "status": job.get("status")}), 409
     return jsonify({"job_id": job_id, "status": job["status"], "outputs": job.get("outputs", []), "summary": job.get("summary", {})})
+
+
+@app.route("/api/jobs/<job_id>/quality-review", methods=["POST"])
+def quality_review_job(job_id: str):
+    """Accept or reject a rendered batch after the tracking quality gate."""
+    job = _job(job_id)
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+    if job.get("status") != "needs_review" or job.get("phase") != "quality_review":
+        return jsonify({"error": "Job is not waiting for output quality review"}), 409
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    if decision not in {"accept", "reject"}:
+        return jsonify({"error": "decision must be accept or reject"}), 400
+    if decision == "accept":
+        job.update({
+            "status": "completed",
+            "phase": "complete",
+            "quality_review": {"decision": "accepted", "failed_fraction": (job.get("quality_gate") or {}).get("failed_fraction")},
+            "error": None,
+        })
+    else:
+        job.update({
+            "status": "failed",
+            "phase": "quality_rejected",
+            "quality_review": {"decision": "rejected", "failed_fraction": (job.get("quality_gate") or {}).get("failed_fraction")},
+            "error": "rendered outputs were rejected during quality review",
+        })
+    _set_job(job)
+    return jsonify(job)
 
 
 @app.route("/api/render", methods=["POST"])

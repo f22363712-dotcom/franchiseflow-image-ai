@@ -15,7 +15,7 @@ STATES = {"queued", "running", "needs_review", "completed", "failed", "vision_fa
 ALLOWED_TRANSITIONS = {
     "queued": {"queued", "running", "needs_review", "completed", "failed"},
     "running": {"running", "queued", "needs_review", "completed", "failed", "vision_failed"},
-    "needs_review": {"needs_review", "queued", "failed"},
+    "needs_review": {"needs_review", "queued", "completed", "failed"},
     "completed": {"completed"},
     "failed": {"failed"},
     "vision_failed": {"vision_failed"},

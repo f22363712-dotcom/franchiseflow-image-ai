@@ -14,6 +14,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const reviewPanel = document.getElementById('review-panel');
   const reviewReasons = document.getElementById('review-reasons');
   const reviewButton = document.getElementById('review-quad');
+  const qualityReviewControls = document.getElementById('quality-review-controls');
+  const qualityAcceptButton = document.getElementById('quality-accept');
+  const qualityRejectButton = document.getElementById('quality-reject');
   const outputsGrid = document.getElementById('outputs-grid');
   const metricFrames = document.getElementById('metric-frames');
   const metricTime = document.getElementById('metric-time');
@@ -381,12 +384,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function renderOutputs(urls) {
+  function renderOutputs(urls, labels = []) {
     outputsGrid.innerHTML = '';
     (urls || []).forEach((url, index) => {
+      const label = labels[index] || `分支门店 ${index + 1}`;
       const card = document.createElement('div');
       card.className = 'output-card';
-      card.innerHTML = `<div class="output-card-header"><span class="branch-tag">Branch ${index + 1}</span><span class="branch-title">分支门店 ${index + 1}</span></div><div class="video-container"><video controls playsinline loop></video></div><div class="output-actions"><a class="btn btn-outline" download>下载成片 MP4</a></div>`;
+      card.innerHTML = `<div class="output-card-header"><span class="branch-tag">Branch ${index + 1}</span><span class="branch-title"></span></div><div class="video-container"><video controls playsinline loop></video></div><div class="output-actions"><a class="btn btn-outline" download>下载成片 MP4</a></div>`;
+      card.querySelector('.branch-title').textContent = label;
       const player = card.querySelector('video');
       const link = card.querySelector('a');
       player.src = url;
@@ -394,7 +399,7 @@ document.addEventListener('DOMContentLoaded', () => {
         card.querySelector('.branch-title').textContent += '（浏览器无法播放）';
       });
       link.href = url;
-      link.download = `branch_${index + 1}.mp4`;
+      link.download = `branch_${index + 1}_${label}.mp4`;
       outputsGrid.appendChild(card);
     });
   }
@@ -403,13 +408,21 @@ document.addEventListener('DOMContentLoaded', () => {
     reviewPanel.hidden = false;
     reviewBranchCount = Math.max(1, Number(job.branch_count) || 1);
     reviewPreviewUrl = job.sample_preview || job.preview || null;
+    const qualityReview = job.phase === 'quality_review' && job.quality_gate && job.quality_gate.passed === false;
+    if (qualityReview) {
+      if (qualityReviewControls) qualityReviewControls.hidden = false;
+      if (reviewButton) reviewButton.hidden = true;
+      if (sceneReviewControls) sceneReviewControls.hidden = true;
+      const gate = job.quality_gate;
+      reviewReasons.textContent = `跟踪质量需要复核：失败帧 ${gate.failed_frames || 0}，失败比例 ${(Number(gate.failed_fraction || 0) * 100).toFixed(1)}%，阈值 ${(Number(gate.max_failed_fraction || 0) * 100).toFixed(1)}%。`;
+      renderOutputs(job.outputs || [], job.branch_labels || (job.summary && job.summary.branch_labels) || []);
+      return;
+    }
+    if (qualityReviewControls) qualityReviewControls.hidden = true;
+    if (reviewButton) reviewButton.hidden = false;
     const multiScene = setupSceneReview(job);
     if (job.asset_bindings_required) {
       reviewReasons.textContent = '检测到多个可替换平面。当前提交会把每个分支素材明确应用到全部已复核平面；需要逐平面分配时请改用 API 的 asset_bindings。';
-    }
-    if (job.quality_gate && job.quality_gate.passed === false) {
-      const gate = job.quality_gate;
-      reviewReasons.textContent = `跟踪质量需要复核：失败帧 ${gate.failed_frames || 0}，失败比例 ${(Number(gate.failed_fraction || 0) * 100).toFixed(1)}%，阈值 ${(Number(gate.max_failed_fraction || 0) * 100).toFixed(1)}%。`;
     }
     if (multiScene) return;
     if (sceneReviewControls) sceneReviewControls.hidden = true;
@@ -473,7 +486,7 @@ document.addEventListener('DOMContentLoaded', () => {
       reviewPanel.hidden = true;
       setStatus('合成完成', 'badge badge-status');
       updateMetrics(job.summary || {}, job.initialization_mode, job);
-      renderOutputs(job.outputs || []);
+      renderOutputs(job.outputs || [], job.branch_labels || (job.summary && job.summary.branch_labels) || []);
       return;
     }
     if (job.status === 'vision_failed') {
@@ -549,6 +562,30 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  async function submitQualityDecision(decision) {
+    if (!activeJobId) return;
+    qualityAcceptButton && (qualityAcceptButton.disabled = true);
+    qualityRejectButton && (qualityRejectButton.disabled = true);
+    try {
+      const response = await fetch(`/api/jobs/${activeJobId}/quality-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+      const job = await response.json();
+      if (!response.ok) throw new Error(job.error || '提交质量复核失败');
+      await pollJob(activeJobId);
+    } catch (error) {
+      showError(error);
+    } finally {
+      qualityAcceptButton && (qualityAcceptButton.disabled = false);
+      qualityRejectButton && (qualityRejectButton.disabled = false);
+    }
+  }
+
+  if (qualityAcceptButton) qualityAcceptButton.addEventListener('click', () => submitQualityDecision('accept'));
+  if (qualityRejectButton) qualityRejectButton.addEventListener('click', () => submitQualityDecision('reject'));
+
   btnLoadSample.addEventListener('click', async () => {
     try {
       const response = await fetch('/api/demo_results');
@@ -557,7 +594,7 @@ document.addEventListener('DOMContentLoaded', () => {
       setStatus('样片就绪 · 人工基线', 'badge badge-status');
       updateMetrics(data.summary || {}, data.initialization_mode || 'manual_fallback');
       drawSampleFrame('/static/sample_first_frame.jpg', data.vision_quad);
-      renderOutputs(data.outputs || []);
+      renderOutputs(data.outputs || [], data.branch_labels || (data.summary && data.summary.branch_labels) || []);
       btnLoadSample.textContent = '已载入人工基线样片';
     } catch (error) {
       showError(error);

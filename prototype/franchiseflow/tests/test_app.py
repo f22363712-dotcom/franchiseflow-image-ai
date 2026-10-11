@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 
 from app import app, JOBS, UPLOAD_DIR, OUTPUT_DIR, _normalise_candidate, _public_summary
-from job_store import load_job, save_job
+from job_store import create_job, load_job, save_job
 from scene_samples import sample_video_scenes
 
 
@@ -185,6 +186,38 @@ class FranchiseFlowAppTests(unittest.TestCase):
         self.assertIn("localStorage", app_js)
         self.assertIn("sample_preview", app_js)
         self.assertIn("redrawReview", app_js)
+        self.assertIn("quality-review", app_js)
+
+    def test_quality_review_can_accept_or_reject_rendered_batch(self):
+        accepted_id = f"quality_accept_test_{uuid.uuid4().hex[:6]}"
+        create_job(OUTPUT_DIR, accepted_id, {
+            "status": "needs_review",
+            "phase": "quality_review",
+            "quality_gate": {"passed": False, "failed_frames": 2, "failed_fraction": 0.4, "max_failed_fraction": 0.25},
+            "outputs": ["/outputs/quality_accept_test/branch_1.mp4"],
+            "summary": {"quality_gate": {"passed": False}},
+        })
+        accepted = self.client.post(f"/api/jobs/{accepted_id}/quality-review", json={"decision": "accept"})
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.get_json()["status"], "completed")
+        self.assertEqual(accepted.get_json()["quality_review"]["decision"], "accepted")
+
+        rejected_id = f"quality_reject_test_{uuid.uuid4().hex[:6]}"
+        create_job(OUTPUT_DIR, rejected_id, {
+            "status": "needs_review",
+            "phase": "quality_review",
+            "quality_gate": {"passed": False, "failed_frames": 3, "failed_fraction": 0.6, "max_failed_fraction": 0.25},
+            "outputs": [],
+        })
+        rejected = self.client.post(f"/api/jobs/{rejected_id}/quality-review", json={"decision": "reject"})
+        self.assertEqual(rejected.status_code, 200)
+        self.assertEqual(rejected.get_json()["status"], "failed")
+
+    def test_quality_review_rejects_invalid_decision(self):
+        job_id = f"quality_invalid_test_{uuid.uuid4().hex[:6]}"
+        create_job(OUTPUT_DIR, job_id, {"status": "needs_review", "phase": "quality_review", "quality_gate": {"passed": False}})
+        response = self.client.post(f"/api/jobs/{job_id}/quality-review", json={"decision": "maybe"})
+        self.assertEqual(response.status_code, 400)
 
     def test_normalises_contact_sheet_candidate_back_to_source_panel(self):
         candidate = {"quad": [[660, 50], [740, 50], [740, 120], [660, 120]], "confidence": 0.9}
