@@ -2,6 +2,18 @@
 
 这份文档和 `prototype/franchiseflow/storage.py` 一起定义存储层的下一步边界。当前服务仍使用每个任务一个 JSON 文件、批次一个 JSON 文件，以及一个幂等索引。`JsonStorageRepository` 只是把这三组已有能力放在同一个接口下，当前应用尚未切换到它。
 
+## 当前代码状态
+
+`storage.py` 已提供 `SQLiteStorageRepository`，使用标准库 `sqlite3` 建立
+`jobs`、`batches` 和 `idempotency_keys` 表。它启用 WAL、外键检查和忙等待，
+把完整业务记录保存在 `payload_json`，并以 `tenant_id='local'` 兼容单机部署。
+幂等 reservation、commit、release 在事务内执行，唯一键由 SQLite 负责跨实例互斥；
+任务记录还带有 `version` 和 `compare_and_swap_job`，可供未来 worker claim 使用。
+
+这段代码目前只通过合同测试和临时数据库测试，`app.py` 仍默认使用 JSON 文件存储。
+不要通过设置一个环境变量就假设服务已经自动切换到 SQLite，也不要把当前实现描述成
+跨副本队列。真正切换前仍需完成迁移、恢复、租约和回滚演练。
+
 ## 当前实现的保证
 
 `JsonStorageRepository` 保留 `job_store.py` 的状态迁移校验、`batch_store.py` 的原子替换和 `idempotency_store.py` 的 pending/committed 两阶段记录。写入先落临时文件并替换目标文件，适合单机进程重启后的恢复。
