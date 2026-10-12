@@ -26,9 +26,10 @@ def build_repository(
     """Build the requested storage repository for a runtime configuration.
 
     ``output_dir``, ``batch_dir`` and ``idempotency_path`` identify the current
-    JSON stores.  SQLite keeps its control-plane database at the explicit
+    JSON stores. SQLite keeps its control-plane database at the explicit
     ``sqlite_path`` when supplied, or at ``output_dir/franchiseflow.db`` by
-    default.  Constructing a repository does not switch ``app.py`` to it.
+    default. The app calls this factory during startup after validating the
+    selected backend.
     """
     normalized_backend = str(backend).strip().lower()
     if normalized_backend not in _SUPPORTED_BACKENDS:
