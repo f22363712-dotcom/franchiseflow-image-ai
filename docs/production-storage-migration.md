@@ -4,13 +4,22 @@
 
 ## 当前代码状态
 
+`storage_runtime.py` 提供 `build_repository(...)` runtime factory。调用方传入
+`backend="json"` 或 `backend="sqlite"`，工厂分别返回
+`JsonStorageRepository` 或 `SQLiteStorageRepository`；其他值会直接抛出
+`ValueError`。SQLite 未传 `sqlite_path` 时使用
+`<output_dir>/franchiseflow.db`，显式传入路径则使用调用方指定的数据库文件。
+这个切片只统一了实例构造，不改变现有服务的启动路径。
+
 `storage.py` 已提供 `SQLiteStorageRepository`，使用标准库 `sqlite3` 建立
 `jobs`、`batches` 和 `idempotency_keys` 表。它启用 WAL、外键检查和忙等待，
 把完整业务记录保存在 `payload_json`，并以 `tenant_id='local'` 兼容单机部署。
 幂等 reservation、commit、release 在事务内执行，唯一键由 SQLite 负责跨实例互斥；
 任务记录还带有 `version` 和 `compare_and_swap_job`，可供未来 worker claim 使用。
 
-这段代码目前只通过合同测试和临时数据库测试，`app.py` 仍默认使用 JSON 文件存储。
+这段代码目前只通过合同测试和临时数据库测试，`app.py` 仍默认使用 JSON 文件存储，
+也没有调用 `storage_runtime.build_repository`。新增工厂不代表应用已经切换后端，
+更不代表队列已经迁移到 SQLite。
 不要通过设置一个环境变量就假设服务已经自动切换到 SQLite，也不要把当前实现描述成
 跨副本队列。真正切换前仍需完成迁移、恢复、租约和回滚演练。
 
