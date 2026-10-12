@@ -66,6 +66,8 @@ docker run --name franchiseflow -p 127.0.0.1:5000:5000 --env-file .env \
 
 本地 JSON 和线程锁要求单个应用进程；当前镜像只运行一个服务实例。多副本部署需要共享数据库和任务队列。服务提供一个可选的单一 API key，仍然没有用户登录、团队角色和租户隔离；需要多人或公网使用时，应在此基础上接入反向代理、身份系统和配额。
 
+控制面默认使用本地 JSON。可以在停机窗口设置 `FRANCHISEFLOW_STORAGE_BACKEND=sqlite`，让任务、批次和幂等记录写入 `FRANCHISEFLOW_SQLITE_PATH` 指定的 SQLite 文件；未设置路径时使用 `outputs/franchiseflow.db`。这个模式仍由单进程 worker 调度，切换前必须按 `docs/production-storage-migration.md` 完成导入、核对和备份，不能把它当作多副本队列。
+
 ### API key
 
 复制 `.env.example` 为 `.env`，只在本地填写：

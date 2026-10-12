@@ -1,8 +1,8 @@
 """Runtime selection seam for FranchiseFlow storage backends.
 
-The application still uses its existing JSON stores.  This factory only makes
-it possible for a caller or migration test to construct either repository
-through one small, explicit entry point.
+The application defaults to JSON and can explicitly construct the SQLite
+control plane through this factory.  The worker remains single-process until
+the queue claim and lease migration is complete.
 """
 from __future__ import annotations
 

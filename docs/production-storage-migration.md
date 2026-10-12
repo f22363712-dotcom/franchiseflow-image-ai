@@ -17,11 +17,9 @@
 幂等 reservation、commit、release 在事务内执行，唯一键由 SQLite 负责跨实例互斥；
 任务记录还带有 `version` 和 `compare_and_swap_job`，可供未来 worker claim 使用。
 
-这段代码目前只通过合同测试和临时数据库测试，`app.py` 仍默认使用 JSON 文件存储，
-也没有调用 `storage_runtime.build_repository`。新增工厂不代表应用已经切换后端，
-更不代表队列已经迁移到 SQLite。
-不要通过设置一个环境变量就假设服务已经自动切换到 SQLite，也不要把当前实现描述成
-跨副本队列。真正切换前仍需完成迁移、恢复、租约和回滚演练。
+`app.py` 现在可以通过 `FRANCHISEFLOW_STORAGE_BACKEND=sqlite` 显式使用这个控制面，
+默认仍是 JSON。SQLite 模式已经接入任务、批次、幂等读取和单进程重启排队扫描，worker
+仍由进程内线程池调度。它还不是跨副本队列；真正切换前仍需完成迁移、恢复、租约和回滚演练。
 
 ## 当前实现的保证
 

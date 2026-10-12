@@ -15,6 +15,7 @@ contract tests.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -45,6 +46,25 @@ from job_store import (
 
 
 JsonRecord = dict[str, Any]
+
+
+def storage_backend_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Validate the selected control-plane backend.
+
+    The application keeps JSON as its default for backwards compatibility.
+    SQLite must be selected explicitly so a deployment cannot appear migrated
+    merely because a database file happens to exist beside the outputs.
+    """
+
+    environment = os.environ if environment is None else environment
+    backend = str(environment.get("FRANCHISEFLOW_STORAGE_BACKEND", "json")).strip().lower()
+    if backend not in {"json", "sqlite"}:
+        raise ValueError(
+            "FRANCHISEFLOW_STORAGE_BACKEND must be one of: json, sqlite"
+        )
+    return backend
 
 
 class StorageRepository(Protocol):

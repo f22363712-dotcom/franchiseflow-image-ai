@@ -25,8 +25,16 @@ REPO_ROOT = BASE_DIR.parents[1]
 sys.path.insert(0, str(REPO_ROOT / "spikes" / "franchiseflow"))
 
 from candidate_validator import validate_candidate
-from job_store import create_job, load_job, save_job
-from batch_store import create_batch, load_batch, save_batch
+from job_store import (
+    create_job as _json_create_job,
+    load_job as _json_load_job,
+    save_job as _json_save_job,
+)
+from batch_store import (
+    create_batch as _json_create_batch,
+    load_batch as _json_load_batch,
+    save_batch as _json_save_batch,
+)
 from batch_delivery import BatchPackageError, build_batch_package
 from brand_profiles import create_profile, list_profiles, load_profile, profile_asset_paths
 from idempotency_store import (
@@ -42,6 +50,8 @@ from scene_samples import sample_video_scenes
 from scene_reuse import transfer_candidate
 from vision_client import VisionClient
 from runtime_health import build_health_snapshot, server_bind
+from storage import storage_backend_from_environment
+from storage_runtime import build_repository
 from input_media import (
     SUPPORTED_SOURCE_EXTS,
     inspect_video,
@@ -62,7 +72,64 @@ BATCH_DIR = OUTPUT_DIR / "batches"
 BATCH_DIR.mkdir(parents=True, exist_ok=True)
 BATCH_PACKAGE_DIR = BATCH_DIR / "packages"
 BATCH_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
-IDEMPOTENCY_STORE = IdempotencyStore(OUTPUT_DIR / "idempotency.json")
+
+
+class _RepositoryIdempotencyStore:
+    """Adapt the SQLite repository to the existing idempotency call shape."""
+
+    def __init__(self, repository: Any, path: Path):
+        self.repository = repository
+        self.path = Path(path)
+
+    def get(self, scope: str, key: str):
+        return self.repository.get_idempotency(scope, key)
+
+    def pending_entries(self):
+        return self.repository.pending_idempotency()
+
+    def reserve(self, scope, key, fingerprint, resource_id=None, status_code=202):
+        return self.repository.reserve_idempotency(
+            scope,
+            key,
+            fingerprint,
+            resource_id=str(resource_id or ""),
+            status_code=status_code,
+        )
+
+    def commit(self, scope, key, fingerprint, resource_id, status_code=202):
+        return self.repository.commit_idempotency(
+            scope,
+            key,
+            fingerprint,
+            resource_id,
+            status_code=status_code,
+        )
+
+    def release(self, scope, key, fingerprint, resource_id=None):
+        return self.repository.release_idempotency(
+            scope,
+            key,
+            fingerprint,
+            resource_id=resource_id,
+        )
+
+
+STORAGE_BACKEND = storage_backend_from_environment()
+SQLITE_PATH = Path(
+    os.environ.get("FRANCHISEFLOW_SQLITE_PATH", "").strip()
+    or (OUTPUT_DIR / "franchiseflow.db")
+)
+STORAGE_REPOSITORY = build_repository(
+    backend=STORAGE_BACKEND,
+    output_dir=OUTPUT_DIR,
+    batch_dir=BATCH_DIR,
+    idempotency_path=OUTPUT_DIR / "idempotency.json",
+    sqlite_path=SQLITE_PATH,
+)
+if STORAGE_BACKEND == "sqlite":
+    IDEMPOTENCY_STORE = _RepositoryIdempotencyStore(STORAGE_REPOSITORY, SQLITE_PATH)
+else:
+    IDEMPOTENCY_STORE = IdempotencyStore(OUTPUT_DIR / "idempotency.json")
 IDEMPOTENCY_PENDING_TTL_SECONDS = DEFAULT_PENDING_TTL_SECONDS
 
 ALLOWED_VIDEO_EXTS = SUPPORTED_SOURCE_EXTS
@@ -106,6 +173,44 @@ IDEMPOTENCY_LOCK = threading.RLock()
 SYNC_LOCK = threading.Lock()
 SYNC_ACTIVE = 0
 _RECOVERY_STARTED = False
+
+
+def create_job(root: str | Path, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.create_job(job_id, payload)
+    return _json_create_job(root, job_id, payload)
+
+
+def load_job(root: str | Path, job_id: str) -> dict[str, Any] | None:
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.load_job(job_id)
+    return _json_load_job(root, job_id)
+
+
+def save_job(root: str | Path, job_id: str, job: dict[str, Any]) -> None:
+    if STORAGE_BACKEND == "sqlite":
+        STORAGE_REPOSITORY.save_job(job_id, job)
+        return
+    _json_save_job(root, job_id, job)
+
+
+def create_batch(root: str | Path, batch_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.create_batch(batch_id, payload)
+    return _json_create_batch(root, batch_id, payload)
+
+
+def load_batch(root: str | Path, batch_id: str) -> dict[str, Any] | None:
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.load_batch(batch_id)
+    return _json_load_batch(root, batch_id)
+
+
+def save_batch(root: str | Path, batch_id: str, batch: dict[str, Any]) -> None:
+    if STORAGE_BACKEND == "sqlite":
+        STORAGE_REPOSITORY.save_batch(batch_id, batch)
+        return
+    _json_save_batch(root, batch_id, batch)
 
 
 def _set_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -275,9 +380,47 @@ def _idempotency_pending_response(scope: str, resource_id: str) -> dict[str, Any
     return {field: resource_id, "status": "processing", "state": "pending"}
 
 
+def _idempotency_get(scope: str, key: str):
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.get_idempotency(scope, key)
+    return IDEMPOTENCY_STORE.get(scope, key)
+
+
+def _idempotency_pending_entries():
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.pending_idempotency()
+    return IDEMPOTENCY_STORE.pending_entries()
+
+
+def _idempotency_commit(scope: str, key: str, fingerprint: str, resource_id: str, status_code: int = 202):
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.commit_idempotency(
+            scope, key, fingerprint, resource_id, status_code=status_code
+        )
+    return IDEMPOTENCY_STORE.commit(scope, key, fingerprint, resource_id, status_code=status_code)
+
+
+def _idempotency_reserve_record(scope: str, key: str, fingerprint: str, resource_id: str, status_code: int = 202):
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.reserve_idempotency(
+            scope, key, fingerprint, resource_id=resource_id, status_code=status_code
+        )
+    return IDEMPOTENCY_STORE.reserve(
+        scope, key, fingerprint, resource_id=resource_id, status_code=status_code
+    )
+
+
+def _idempotency_release_record(scope: str, key: str, fingerprint: str, resource_id: str):
+    if STORAGE_BACKEND == "sqlite":
+        return STORAGE_REPOSITORY.release_idempotency(
+            scope, key, fingerprint, resource_id=resource_id
+        )
+    return IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id)
+
+
 def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[str, Any] | None, int] | None:
     """Return a previously created resource, or raise on payload mismatch."""
-    entry = IDEMPOTENCY_STORE.get(scope, key)
+    entry = _idempotency_get(scope, key)
     if entry is None:
         return None
     if entry.get("fingerprint") != fingerprint:
@@ -289,7 +432,7 @@ def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[st
             # A crash can leave the durable resource present while the final
             # committed-index write never happened. Finish that transition on
             # the first retry instead of creating a second resource.
-            IDEMPOTENCY_STORE.commit(
+            _idempotency_commit(
                 scope,
                 key,
                 fingerprint,
@@ -301,7 +444,7 @@ def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[st
             entry,
             ttl_seconds=IDEMPOTENCY_PENDING_TTL_SECONDS,
         ):
-            IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id)
+            _idempotency_release_record(scope, key, fingerprint, resource_id)
             return None
         return _idempotency_pending_response(scope, resource_id), 202
     resource = _idempotency_resource(scope, resource_id)
@@ -311,22 +454,40 @@ def _idempotency_replay(scope: str, key: str, fingerprint: str) -> tuple[dict[st
 
 
 def _idempotency_record(scope: str, key: str, fingerprint: str, resource_id: str, status_code: int) -> None:
-    IDEMPOTENCY_STORE.commit(scope, key, fingerprint, resource_id, status_code=status_code)
+    _idempotency_commit(scope, key, fingerprint, resource_id, status_code=status_code)
 
 
 def _idempotency_reserve(scope: str, key: str, fingerprint: str, resource_id: str) -> dict[str, Any]:
     """Reserve the caller-selected ID after replay checks have completed."""
-    return IDEMPOTENCY_STORE.reserve(scope, key, fingerprint, resource_id=resource_id)
+    return _idempotency_reserve_record(scope, key, fingerprint, resource_id)
 
 
 def _idempotency_release(scope: str, key: str, fingerprint: str, resource_id: str) -> None:
-    IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id)
+    _idempotency_release_record(scope, key, fingerprint, resource_id)
 
 
 def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
     """Read durable job summaries so review work survives a browser restart."""
     limit = max(1, min(int(limit), 100))
     jobs: list[dict[str, Any]] = []
+    if STORAGE_BACKEND == "sqlite":
+        durable_jobs = STORAGE_REPOSITORY.list_jobs(limit=limit, status=status)
+        for job in durable_jobs:
+            jobs.append({
+                "job_id": job.get("job_id"),
+                "batch_id": job.get("batch_id"),
+                "status": job.get("status"),
+                "phase": job.get("phase"),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+                "branch_count": job.get("branch_count"),
+                "branch_labels": job.get("branch_labels", []),
+                "scene_count": len(job.get("scenes", [])) if isinstance(job.get("scenes"), list) else None,
+                "initialization_mode": job.get("initialization_mode"),
+                "error": _public_error(job.get("error")),
+                "outputs": job.get("outputs", []),
+            })
+        return jobs
     for state_path in OUTPUT_DIR.glob("*/job.json"):
         try:
             job = load_job(OUTPUT_DIR, state_path.parent.name)
@@ -1425,7 +1586,7 @@ def _recover_idempotency_entries() -> dict[str, int]:
     released = 0
     errors = 0
     try:
-        entries = IDEMPOTENCY_STORE.pending_entries()
+        entries = _idempotency_pending_entries()
     except (OSError, RuntimeError, IdempotencyError):
         return {"repaired": 0, "released": 0, "errors": 1}
     for entry in entries:
@@ -1438,7 +1599,7 @@ def _recover_idempotency_entries() -> dict[str, int]:
             continue
         try:
             if _idempotency_resource(scope, resource_id) is not None:
-                IDEMPOTENCY_STORE.commit(
+                _idempotency_commit(
                     scope,
                     key,
                     fingerprint,
@@ -1447,7 +1608,7 @@ def _recover_idempotency_entries() -> dict[str, int]:
                 )
                 repaired += 1
             else:
-                if IDEMPOTENCY_STORE.release(scope, key, fingerprint, resource_id):
+                if _idempotency_release_record(scope, key, fingerprint, resource_id):
                     released += 1
         except (IdempotencyConflict, IdempotencyError, OSError, RuntimeError):
             errors += 1
@@ -1464,35 +1625,50 @@ def _reconcile_orphaned_batch_jobs() -> dict[str, Any]:
     and jobs from a deleted/failed batch are left untouched.
     """
     batches: dict[str, dict[str, Any]] = {}
-    try:
-        batch_paths = sorted(BATCH_DIR.glob("*.json"), key=lambda path: path.name)
-    except OSError:
-        return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
-    for batch_path in batch_paths:
-        batch_id = batch_path.stem
-        if not JOB_ID_RE.fullmatch(batch_id):
-            continue
+    if STORAGE_BACKEND == "sqlite":
         try:
-            batch = load_batch(BATCH_DIR, batch_id)
-        except (ValueError, RuntimeError, OSError):
-            continue
-        if isinstance(batch, dict):
-            batches[batch_id] = batch
+            for batch in STORAGE_REPOSITORY.list_batches():
+                batch_id = str(batch.get("batch_id") or "")
+                if JOB_ID_RE.fullmatch(batch_id):
+                    batches[batch_id] = batch
+            durable_jobs = STORAGE_REPOSITORY.list_jobs()
+        except (OSError, RuntimeError, ValueError):
+            return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
+    else:
+        try:
+            batch_paths = sorted(BATCH_DIR.glob("*.json"), key=lambda path: path.name)
+        except OSError:
+            return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
+        for batch_path in batch_paths:
+            batch_id = batch_path.stem
+            if not JOB_ID_RE.fullmatch(batch_id):
+                continue
+            try:
+                batch = load_batch(BATCH_DIR, batch_id)
+            except (ValueError, RuntimeError, OSError):
+                continue
+            if isinstance(batch, dict):
+                batches[batch_id] = batch
     if not batches:
         return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 0}
 
     candidates: dict[str, list[dict[str, Any]]] = {batch_id: [] for batch_id in batches}
-    try:
-        state_paths = sorted(OUTPUT_DIR.glob("*/job.json"), key=lambda path: path.parent.name)
-    except OSError:
-        return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
-    for state_path in state_paths:
-        job_id = state_path.parent.name
-        if not JOB_ID_RE.fullmatch(job_id):
-            continue
+    if STORAGE_BACKEND != "sqlite":
         try:
-            job = load_job(OUTPUT_DIR, job_id)
-        except (ValueError, RuntimeError, OSError):
+            state_paths = sorted(OUTPUT_DIR.glob("*/job.json"), key=lambda path: path.parent.name)
+        except OSError:
+            return {"repaired_batches": 0, "repaired_jobs": 0, "errors": 1}
+        durable_jobs = []
+        for state_path in state_paths:
+            try:
+                job = load_job(OUTPUT_DIR, state_path.parent.name)
+            except (ValueError, RuntimeError, OSError):
+                continue
+            if isinstance(job, dict):
+                durable_jobs.append(job)
+    for job in durable_jobs:
+        job_id = str(job.get("job_id") or "")
+        if not JOB_ID_RE.fullmatch(job_id):
             continue
         if not isinstance(job, dict):
             continue
@@ -1537,13 +1713,21 @@ def _reconcile_orphaned_batch_jobs() -> dict[str, Any]:
 
 def _schedule_queued_jobs() -> None:
     """Fill available worker slots from durable queued/running job state."""
-    for state_path in OUTPUT_DIR.glob("*/job.json"):
+    if STORAGE_BACKEND == "sqlite":
+        durable_jobs = STORAGE_REPOSITORY.list_jobs()
+    else:
+        durable_jobs = []
+        for state_path in OUTPUT_DIR.glob("*/job.json"):
+            try:
+                job = load_job(OUTPUT_DIR, state_path.parent.name)
+            except (ValueError, RuntimeError, OSError):
+                continue
+            if job:
+                durable_jobs.append(job)
+    for durable_job in durable_jobs:
         if _active_slot_count() >= MAX_ACTIVE_JOBS:
             break
-        try:
-            job = load_job(OUTPUT_DIR, state_path.parent.name)
-        except (ValueError, RuntimeError, OSError):
-            continue
+        job = durable_job
         if not job or job.get("status") not in {"queued", "running"}:
             continue
         if job.get("job_id") in FUTURES:
@@ -1667,6 +1851,23 @@ def health_endpoint():
         worker_capacity=MAX_ACTIVE_JOBS,
         recovery_started=_RECOVERY_STARTED,
     )
+    if STORAGE_BACKEND == "sqlite":
+        sqlite_jobs = STORAGE_REPOSITORY.list_jobs()
+        sqlite_batches = STORAGE_REPOSITORY.list_batches()
+        snapshot["persistence"]["backend"] = "sqlite"
+        snapshot["persistence"]["jobs"] = {
+            "records": len(sqlite_jobs),
+            "unreadable": 0,
+            "queued": sum(job.get("status") == "queued" for job in sqlite_jobs),
+        }
+        snapshot["persistence"]["batches"] = {
+            "records": len(sqlite_batches),
+            "unreadable": 0,
+            "queued": sum(batch.get("status") == "queued" for batch in sqlite_batches),
+        }
+        snapshot["worker"]["queued"] = sum(
+            job.get("status") == "queued" for job in sqlite_jobs
+        )
     if _configured_api_key() is not None and not getattr(g, "api_authenticated", False):
         # Anonymous probes must not disclose local paths, storage counts, or
         # queue state.  Keep the same readiness status code for orchestration.
@@ -1942,6 +2143,12 @@ def list_batches_endpoint():
     except ValueError:
         return jsonify({"error": "limit must be an integer"}), 400
     batches: list[dict[str, Any]] = []
+    if STORAGE_BACKEND == "sqlite":
+        batches = [
+            _batch_public(batch)
+            for batch in STORAGE_REPOSITORY.list_batches(limit=limit)
+        ]
+        return jsonify({"batches": batches[:limit]})
     for state_path in BATCH_DIR.glob("*.json"):
         batch_id = state_path.stem
         try:
