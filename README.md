@@ -64,7 +64,7 @@ docker run --name franchiseflow -p 127.0.0.1:5000:5000 --env-file .env \
 
 `GET /api/health` 提供版本、当前运行数、持久化排队数、FFmpeg/FFprobe 可用性和目录权限。持久化 JSON 不可读、工具缺失或目录不可写时返回 HTTP 503，其余返回 HTTP 200。接口不启动恢复、不写文件，也不返回任务 ID、绝对路径、环境变量或 API key。目录可写性来自权限检查，磁盘容量与后续写入仍可能发生变化。容器健康检查每 30 秒调用一次这个接口。
 
-本地 JSON 和线程锁要求单个应用进程；当前镜像只运行一个服务实例。多副本部署需要共享数据库和任务队列。当前服务没有登录和团队权限，部署在受控网络中，公网接入需要先增加身份验证。
+本地 JSON 和线程锁要求单个应用进程；当前镜像只运行一个服务实例。多副本部署需要共享数据库和任务队列。服务提供一个可选的单一 API key，仍然没有用户登录、团队角色和租户隔离；需要多人或公网使用时，应在此基础上接入反向代理、身份系统和配额。
 
 ### API key
 
@@ -74,7 +74,11 @@ docker run --name franchiseflow -p 127.0.0.1:5000:5000 --env-file .env \
 BANANA_API_KEY=...
 BANANA_API_BASE_URL=https://keungliang.dpdns.org/v1
 BANANA_VISION_MODEL=gemini-3.1-flash-image
+FRANCHISEFLOW_API_KEY=replace-with-a-long-random-value
+DEMO_MODE=0
 ```
+
+设置 `FRANCHISEFLOW_API_KEY` 后，所有 `/api/*`（`/api/health` 除外）和 `/outputs/*` 请求都需要 `Authorization: Bearer <key>` 或 `X-API-Key: <key>`。匿名健康探针只返回 `status` 和 `version`；带 key 的健康请求才返回队列、工具和存储诊断。未设置该变量时保留本地开发兼容行为。`/api/demo_results` 默认关闭，只有显式设置 `DEMO_MODE=1` 才会分发预置样片。
 
 `.env` 被 Git 忽略。日志、任务 JSON、预览图和提交历史不会写入密钥。
 

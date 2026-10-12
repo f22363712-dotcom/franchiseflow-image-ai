@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -15,7 +16,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 
 # Support imports from spikes/franchiseflow.
@@ -85,6 +86,13 @@ MAX_SURFACES_PER_SCENE = 4
 SURFACE_OVERLAP_THRESHOLD = 0.25
 MAX_PROFILE_COUNT = 100
 
+# Optional deployment guard.  Leaving the key unset keeps the local prototype
+# and hackathon replay path backwards compatible.  A configured key protects
+# every API and output artifact request while allowing an anonymous, minimal
+# health probe for load balancers.
+API_KEY_ENV = "FRANCHISEFLOW_API_KEY"
+DEMO_MODE_ENV = "DEMO_MODE"
+
 # Reject oversized multipart bodies before Werkzeug spools them to disk. The
 # small allowance covers multipart headers and form fields; the exact payload
 # total is checked again after each file is saved below.
@@ -115,6 +123,67 @@ def _public_summary(summary: dict[str, Any]) -> dict[str, Any]:
     if isinstance(public.get("output_videos"), list):
         public["output_videos"] = [Path(str(item)).name for item in public["output_videos"]]
     return public
+
+
+_ABSOLUTE_PATH_IN_ERROR = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\|/(?:[^\s/]+/)+)[^\s'\"]+")
+
+
+def _public_error(error: Any) -> Any:
+    """Keep local filesystem details out of task responses.
+
+    Validation messages remain useful to operators, but an exception that
+    contains an absolute path is reduced to a stable public message.  The
+    durable job record still retains the original value for local recovery.
+    """
+    if error is None:
+        return None
+    text = str(error)
+    if _ABSOLUTE_PATH_IN_ERROR.search(text):
+        return "processing failed; server details are withheld"
+    return text
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    public = dict(job)
+    if "error" in public:
+        public["error"] = _public_error(public.get("error"))
+    return public
+
+
+def _configured_api_key() -> str | None:
+    value = os.environ.get(API_KEY_ENV, "").strip()
+    return value or None
+
+
+def _request_api_key() -> str | None:
+    explicit = request.headers.get("X-API-Key")
+    if explicit:
+        return explicit.strip() or None
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return None
+
+
+def _request_is_authenticated() -> bool:
+    configured = _configured_api_key()
+    if configured is None:
+        return True
+    supplied = _request_api_key()
+    return supplied is not None and hmac.compare_digest(supplied, configured)
+
+
+def _unauthorized_response():
+    response = jsonify({"error": "authentication required"})
+    response.status_code = 401
+    response.headers["WWW-Authenticate"] = "Bearer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _demo_mode_enabled() -> bool:
+    return os.environ.get(DEMO_MODE_ENV, "").strip() == "1"
 
 
 def _write_manifest(job: dict[str, Any]) -> None:
@@ -276,7 +345,7 @@ def _list_jobs(limit: int = 20, status: str | None = None) -> list[dict[str, Any
             "branch_labels": job.get("branch_labels", []),
             "scene_count": len(job.get("scenes", [])) if isinstance(job.get("scenes"), list) else None,
             "initialization_mode": job.get("initialization_mode"),
-            "error": job.get("error"),
+            "error": _public_error(job.get("error")),
             "outputs": job.get("outputs", []),
         })
     jobs.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -1505,7 +1574,7 @@ def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
             "phase": job.get("phase"),
             "branch_count": job.get("branch_count"),
             "branch_labels": job.get("branch_labels", []),
-            "error": job.get("error"),
+            "error": _public_error(job.get("error")),
             "outputs": job.get("outputs", []),
             "summary": job.get("summary", {}),
         })
@@ -1544,6 +1613,27 @@ def _batch_public(batch: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.before_request
+def _protect_api_and_outputs():
+    """Apply the optional deployment API key without logging credentials."""
+    configured = _configured_api_key()
+    path = request.path
+    is_health = path == "/api/health"
+    is_protected = path == "/api" or path.startswith("/api/") or path == "/outputs" or path.startswith("/outputs/")
+    if configured is None:
+        g.api_authenticated = True
+        return None
+    authenticated = _request_is_authenticated()
+    g.api_authenticated = authenticated
+    # Health stays probeable without credentials.  Its handler deliberately
+    # emits only status/version when this flag is false.
+    if is_health:
+        return None
+    if is_protected and not authenticated:
+        return _unauthorized_response()
+    return None
+
+
+@app.before_request
 def _recover_jobs_for_wsgi() -> None:
     """Recover durable work when the module is loaded by a WSGI server."""
     global _RECOVERY_STARTED
@@ -1577,6 +1667,10 @@ def health_endpoint():
         worker_capacity=MAX_ACTIVE_JOBS,
         recovery_started=_RECOVERY_STARTED,
     )
+    if _configured_api_key() is not None and not getattr(g, "api_authenticated", False):
+        # Anonymous probes must not disclose local paths, storage counts, or
+        # queue state.  Keep the same readiness status code for orchestration.
+        snapshot = {key: snapshot[key] for key in ("status", "version")}
     response = jsonify(snapshot)
     response.status_code = 200 if snapshot["status"] == "healthy" else 503
     response.headers["Cache-Control"] = "no-store"
@@ -1950,7 +2044,7 @@ def get_job(job_id: str):
     job = _job(job_id)
     if job is None:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify(job)
+    return jsonify(_public_job(job))
 
 
 @app.route("/api/jobs/<job_id>/retry", methods=["POST"])
@@ -2053,7 +2147,7 @@ def retry_job(job_id: str):
             backup_root.rmdir()
         except OSError:
             pass
-    return jsonify(_job(job_id) or retry_job_state), 202
+    return jsonify(_public_job(_job(job_id) or retry_job_state)), 202
 
 
 @app.route("/api/jobs/<job_id>/review", methods=["POST"])
@@ -2145,7 +2239,7 @@ def review_job(job_id: str):
         previous["phase"] = "human_review"
         _set_job(previous)
         return jsonify({"error": str(exc)}), 429
-    return jsonify(job), 202
+    return jsonify(_public_job(job)), 202
 
 
 @app.route("/api/jobs/<job_id>/outputs", methods=["GET"])
@@ -2185,7 +2279,7 @@ def quality_review_job(job_id: str):
             "error": "rendered outputs were rejected during quality review",
         })
     _set_job(job)
-    return jsonify(job)
+    return jsonify(_public_job(job))
 
 
 @app.route("/api/render", methods=["POST"])
@@ -2203,7 +2297,7 @@ def render_job():
     if job.get("status") != "completed":
         code = 400 if job.get("input_error") else (502 if "HTTP 401" in job.get("error", "") or "HTTP 403" in job.get("error", "") else 500)
         return jsonify({
-            "error": job.get("error", "render failed"),
+            "error": _public_error(job.get("error", "render failed")),
             "status": job.get("status"),
             "job_id": job.get("job_id"),
             "review_url": f"/api/jobs/{job['job_id']}/review" if job.get("status") == "needs_review" else None,
@@ -2224,6 +2318,8 @@ def render_job():
 
 @app.route("/api/demo_results", methods=["GET"])
 def get_demo_results():
+    if not _demo_mode_enabled():
+        return jsonify({"error": "demo mode is disabled"}), 404
     demo_dir = REPO_ROOT / "spikes" / "franchiseflow" / "outputs_demo_h264"
     if not demo_dir.exists():
         return jsonify({"error": "Demo outputs not ready"}), 404
